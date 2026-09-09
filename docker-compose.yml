@@ -1,0 +1,62 @@
+services:
+  server:
+    image: qa-buddy:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "docker/dev-watch.mjs", "server"]
+    environment:
+      PORT: "3003"
+      HOST: "0.0.0.0"
+      QA_BUDDY_DATA_DIR: /data
+    ports:
+      - "3003:3003"
+    volumes:
+      - qa-buddy-data:/data
+      - ./apps/server/src:/app/apps/server/src:ro
+      - ./apps/web/src:/app/apps/web/src:ro
+      - ./apps/web/index.html:/app/apps/web/index.html:ro
+      - ./packages/db/src:/app/packages/db/src:ro
+      - ./packages/shared/src:/app/packages/shared/src:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3003/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    image: qa-buddy:local
+    command: ["node", "docker/dev-watch.mjs", "worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      QA_BUDDY_DATA_DIR: /data
+      QA_BUDDY_WORKSPACE_DIR: /workspaces
+      QA_BUDDY_WORKSPACE_VOLUME: qa-buddy-workspaces
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      RUN_HISTORY_LIMIT: "${RUN_HISTORY_LIMIT:-20}"
+    volumes:
+      - qa-buddy-data:/data
+      - qa-buddy-workspaces:/workspaces
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./apps/worker/src:/app/apps/worker/src:ro
+      - ./packages/db/src:/app/packages/db/src:ro
+      - ./packages/shared/src:/app/packages/shared/src:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  qa-buddy-data:
+    name: qa-buddy-data
+  qa-buddy-workspaces:
+    name: qa-buddy-workspaces

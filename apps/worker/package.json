@@ -1,0 +1,19 @@
+{
+  "name": "@qa-buddy/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@qa-buddy/db": "workspace:*",
+    "@qa-buddy/shared": "workspace:*",
+    "dockerode": "^4.0.4",
+    "fast-glob": "^3.3.3",
+    "yaml": "^2.7.0"
+  }
+}
