@@ -2,7 +2,7 @@ import path from "node:path";
 import Docker from "dockerode";
 import { QaBuddyDatabase } from "@qa-buddy/db";
 import { QaBuddyWorker } from "./worker.js";
-import { githubAuthenticationMessage } from "./git.js";
+import { githubAuthenticationMessage, githubRegistryAuthenticationMessage } from "./git.js";
 
 const dataDirectory = process.env.QA_BUDDY_DATA_DIR ?? path.resolve("data");
 const workspaceDirectory = process.env.QA_BUDDY_WORKSPACE_DIR ?? path.resolve("workspaces");
@@ -33,6 +33,7 @@ process.on("SIGTERM", shutdown);
 
 try {
   console.info(githubAuthenticationMessage(githubToken));
+  console.info(githubRegistryAuthenticationMessage(process.env.GITHUB_IDP_REGISTRY));
   await worker.run();
 } catch (error) {
   console.error(error);

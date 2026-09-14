@@ -34,7 +34,7 @@ services:
   worker:
     image: qa-buddy:local
     command: ["node", "docker/dev-watch.mjs", "worker"]
-    # Read GITHUB_TOKEN from this file, not the shell running Compose.
+    # Read GITHUB_TOKEN and GITHUB_IDP_REGISTRY from this file, not shell overrides.
     env_file:
       - path: .env
         required: false

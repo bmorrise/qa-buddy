@@ -91,7 +91,7 @@ Values belong in `.env`, not in the dashboard. Add only their names to a reposit
 
 `GITHUB_TOKEN` is reserved for cloning and is rejected from runner allowlists. Use a separate, narrowly scoped package token such as `NPM_TOKEN` when tests need private packages.
 
-If a repository's `.npmrc` references a named variable, put that variable in `.env` and add only its name to the repository's environment allowlist. For example, ID Plans uses `GITHUB_IDP_REGISTRY`. GitHub's npm package registry currently requires a personal access token (classic) with at least `read:packages`; keep this package token separate from the repository clone token.
+If a repository's `.npmrc` references a named variable, put that variable in `.env` and add only its name to the repository's environment allowlist. For example, ID Plans uses `GITHUB_IDP_REGISTRY`. The Docker worker reads this token from `.env`, ignoring shell overrides, and displays its first 10 characters followed by `********` in startup and run logs (short tokens are fully redacted). Recreate the worker after changing it. Run logs also indicate when the token is not allowlisted for that repository. GitHub's npm package registry currently requires a personal access token (classic) with at least `read:packages`; keep this package token separate from the repository clone token.
 
 ## Architecture and security
 

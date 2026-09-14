@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { githubAuthenticationMessage, githubFetchFailureMessage } from "./git.js";
+import { githubAuthenticationMessage, githubFetchFailureMessage, githubRegistryAuthenticationMessage } from "./git.js";
 
 describe("GitHub clone authentication diagnostics", () => {
   it("shows only the first ten token characters with a masked suffix", () => {
@@ -29,5 +29,26 @@ describe("GitHub clone authentication diagnostics", () => {
     const message = githubFetchFailureMessage(true);
     expect(message).toContain("GITHUB_TOKEN can read this repository");
     expect(message).toContain("requested ref exists");
+  });
+});
+
+describe("GitHub package registry authentication diagnostics", () => {
+  it("shows only the first ten registry token characters", () => {
+    const token = "ghp_registry_private_remainder";
+    const message = githubRegistryAuthenticationMessage(token);
+    expect(message).toBe("Package registry authentication: GITHUB_IDP_REGISTRY is configured (ghp_regist********)");
+    expect(message).not.toContain(token);
+    expect(message).not.toContain(token.slice(10));
+  });
+
+  it.each(["short", "1234567890"])("fully redacts short registry tokens (%s)", (token) => {
+    expect(githubRegistryAuthenticationMessage(token)).toBe(
+      "Package registry authentication: GITHUB_IDP_REGISTRY is configured ([REDACTED])"
+    );
+  });
+
+  it("reports a missing registry token", () => {
+    expect(githubRegistryAuthenticationMessage()).toContain("GITHUB_IDP_REGISTRY is not configured");
+    expect(githubRegistryAuthenticationMessage("")).toContain("GITHUB_IDP_REGISTRY is not configured");
   });
 });

@@ -3,12 +3,21 @@ import path from "node:path";
 import type { RunLogger } from "./logger.js";
 import { ProcessError, runProcess } from "./process.js";
 
+function tokenPreview(token: string): string {
+  return token.length > 10 ? `${token.slice(0, 10)}********` : "[REDACTED]";
+}
+
 export function githubAuthenticationMessage(token?: string): string {
   if (!token) {
     return "GitHub authentication: not configured; clone access is limited to public repositories";
   }
-  const preview = token.length > 10 ? `${token.slice(0, 10)}********` : "[REDACTED]";
-  return `GitHub authentication: GITHUB_TOKEN is configured (${preview})`;
+  return `GitHub authentication: GITHUB_TOKEN is configured (${tokenPreview(token)})`;
+}
+
+export function githubRegistryAuthenticationMessage(token?: string): string {
+  return token
+    ? `Package registry authentication: GITHUB_IDP_REGISTRY is configured (${tokenPreview(token)})`
+    : "Package registry authentication: GITHUB_IDP_REGISTRY is not configured";
 }
 
 export function githubFetchFailureMessage(tokenConfigured: boolean): string {

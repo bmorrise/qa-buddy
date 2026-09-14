@@ -13,7 +13,7 @@ import {
 } from "@qa-buddy/shared";
 import { clearAppReports, detectPnpmWorkspaceApps, discoverCoverageReport } from "./detection.js";
 import { cleanupOrphanRunners, DockerRunner, RunnerTimeoutError } from "./docker-runner.js";
-import { cloneRepository, githubAuthenticationMessage } from "./git.js";
+import { cloneRepository, githubAuthenticationMessage, githubRegistryAuthenticationMessage } from "./git.js";
 import { RunLogger } from "./logger.js";
 import { ProcessError } from "./process.js";
 import { readTestResults } from "./test-results.js";
@@ -111,6 +111,7 @@ export class QaBuddyWorker {
     const environment = this.runnerEnvironment(run);
     const logger = new RunLogger(this.options.dataDirectory, run.id, [
       this.options.githubToken,
+      process.env.GITHUB_IDP_REGISTRY,
       ...Object.values(environment)
     ]);
     const runDirectory = this.safeRunDirectory(run.id);
@@ -127,6 +128,10 @@ export class QaBuddyWorker {
         : "Selected apps: all detected or configured apps"
     );
     logger.line(githubAuthenticationMessage(this.options.githubToken));
+    logger.line(githubRegistryAuthenticationMessage(process.env.GITHUB_IDP_REGISTRY));
+    if (process.env.GITHUB_IDP_REGISTRY && !environment.GITHUB_IDP_REGISTRY) {
+      logger.line("GITHUB_IDP_REGISTRY is not passed to this run; add it to the repository's environment allowlist to enable package authentication.");
+    }
 
     try {
       const clone = await cloneRepository({
