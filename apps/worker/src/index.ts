@@ -2,11 +2,13 @@ import path from "node:path";
 import Docker from "dockerode";
 import { QaBuddyDatabase } from "@qa-buddy/db";
 import { QaBuddyWorker } from "./worker.js";
+import { githubAuthenticationMessage } from "./git.js";
 
 const dataDirectory = process.env.QA_BUDDY_DATA_DIR ?? path.resolve("data");
 const workspaceDirectory = process.env.QA_BUDDY_WORKSPACE_DIR ?? path.resolve("workspaces");
 const databasePath = process.env.QA_BUDDY_DATABASE_PATH ?? path.join(dataDirectory, "qa-buddy.sqlite");
 const historyLimit = Math.max(1, Number(process.env.RUN_HISTORY_LIMIT ?? 20));
+const githubToken = process.env.GITHUB_TOKEN || undefined;
 
 const database = new QaBuddyDatabase(databasePath);
 const docker = new Docker({ socketPath: process.env.DOCKER_SOCKET ?? "/var/run/docker.sock" });
@@ -16,7 +18,7 @@ const worker = new QaBuddyWorker({
   dataDirectory,
   workspaceDirectory,
   workspaceVolume: process.env.QA_BUDDY_WORKSPACE_VOLUME ?? "qa-buddy-workspaces",
-  githubToken: process.env.GITHUB_TOKEN || undefined,
+  githubToken,
   historyLimit
 });
 
@@ -30,6 +32,7 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 try {
+  console.info(githubAuthenticationMessage(githubToken));
   await worker.run();
 } catch (error) {
   console.error(error);

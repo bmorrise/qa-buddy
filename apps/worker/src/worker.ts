@@ -13,7 +13,7 @@ import {
 } from "@qa-buddy/shared";
 import { clearAppReports, detectPnpmWorkspaceApps, discoverCoverageReport } from "./detection.js";
 import { cleanupOrphanRunners, DockerRunner, RunnerTimeoutError } from "./docker-runner.js";
-import { cloneRepository } from "./git.js";
+import { cloneRepository, githubAuthenticationMessage } from "./git.js";
 import { RunLogger } from "./logger.js";
 import { ProcessError } from "./process.js";
 import { readTestResults } from "./test-results.js";
@@ -126,11 +126,7 @@ export class QaBuddyWorker {
         ? `Selected apps: ${run.configurationSnapshot.selectedApps.join(", ")}`
         : "Selected apps: all detected or configured apps"
     );
-    logger.line(
-      this.options.githubToken
-        ? "GitHub authentication: GITHUB_TOKEN is configured"
-        : "GitHub authentication: not configured; clone access is limited to public repositories"
-    );
+    logger.line(githubAuthenticationMessage(this.options.githubToken));
 
     try {
       const clone = await cloneRepository({

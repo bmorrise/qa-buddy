@@ -30,7 +30,7 @@ Then apply it to the worker:
 docker compose up -d --force-recreate worker
 ```
 
-You can also supply `GITHUB_TOKEN` from the shell running Compose. QA Buddy passes the token to Git through a non-interactive askpass helper; it is not stored in SQLite, embedded in repository URLs, sent to runner containers, or written to logs. If the organization requires approval or SSO authorization for tokens, complete that in GitHub before running the repository.
+The Docker worker reads `GITHUB_TOKEN` from `.env`; a token exported in the shell running Compose does not override it. After changing or removing the token in `.env`, recreate the worker with the command above. Restarting an existing container does not reload its environment. Startup and run logs show the first 10 token characters followed by `********` so you can identify the configured token; tokens of 10 characters or fewer are fully redacted. QA Buddy passes the token to Git through a non-interactive askpass helper; the full token is not stored in SQLite, embedded in repository URLs, sent to runner containers, or written to logs. If the organization requires approval or SSO authorization for tokens, complete that in GitHub before running the repository.
 
 ## Configure a repository
 

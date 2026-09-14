@@ -34,6 +34,7 @@ services:
   worker:
     image: qa-buddy:local
     command: ["node", "docker/dev-watch.mjs", "worker"]
+    # Read GITHUB_TOKEN from this file, not the shell running Compose.
     env_file:
       - path: .env
         required: false
@@ -41,7 +42,6 @@ services:
       QA_BUDDY_DATA_DIR: /data
       QA_BUDDY_WORKSPACE_DIR: /workspaces
       QA_BUDDY_WORKSPACE_VOLUME: qa-buddy-workspaces
-      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       RUN_HISTORY_LIMIT: "${RUN_HISTORY_LIMIT:-20}"
     volumes:
       - qa-buddy-data:/data

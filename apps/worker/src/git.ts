@@ -3,6 +3,14 @@ import path from "node:path";
 import type { RunLogger } from "./logger.js";
 import { ProcessError, runProcess } from "./process.js";
 
+export function githubAuthenticationMessage(token?: string): string {
+  if (!token) {
+    return "GitHub authentication: not configured; clone access is limited to public repositories";
+  }
+  const preview = token.length > 10 ? `${token.slice(0, 10)}********` : "[REDACTED]";
+  return `GitHub authentication: GITHUB_TOKEN is configured (${preview})`;
+}
+
 export function githubFetchFailureMessage(tokenConfigured: boolean): string {
   return tokenConfigured
     ? "GitHub fetch failed. Verify that GITHUB_TOKEN can read this repository and that the requested ref exists"
