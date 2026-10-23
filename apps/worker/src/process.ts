@@ -4,7 +4,8 @@ import type { RunLogger } from "./logger.js";
 export class ProcessError extends Error {
   constructor(
     message: string,
-    readonly exitCode: number | null
+    readonly exitCode: number | null,
+    readonly stderr = ""
   ) {
     super(message);
   }
@@ -36,12 +37,13 @@ export async function runProcess(options: {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let stdout = "";
+    let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       child.kill("SIGKILL");
       settled = true;
-      reject(new ProcessError(`Command timed out: ${display}`, null));
+      reject(new ProcessError(`Command timed out: ${display}`, null, stderr));
     }, Math.max(1, options.timeoutMs));
 
     child.stdout.on("data", (chunk: Buffer) => {
@@ -49,7 +51,11 @@ export async function runProcess(options: {
       stdout += value;
       if (!options.quiet) options.logger.write(value);
     });
-    child.stderr.on("data", (chunk: Buffer) => options.logger.write(chunk.toString("utf8")));
+    child.stderr.on("data", (chunk: Buffer) => {
+      const value = chunk.toString("utf8");
+      stderr += value;
+      options.logger.write(value);
+    });
     child.on("error", (error) => {
       if (settled) return;
       settled = true;
@@ -61,7 +67,7 @@ export async function runProcess(options: {
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve({ exitCode: 0, stdout });
-      else reject(new ProcessError(`Command exited with code ${code ?? "unknown"}: ${display}`, code));
+      else reject(new ProcessError(`Command exited with code ${code ?? "unknown"}: ${display}`, code, stderr));
     });
   });
 }

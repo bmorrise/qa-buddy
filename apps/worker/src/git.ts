@@ -26,6 +26,50 @@ export function githubFetchFailureMessage(tokenConfigured: boolean): string {
     : "GitHub fetch failed. This repository may be private; set GITHUB_TOKEN in .env and recreate the worker";
 }
 
+/**
+ * GitHub occasionally rejects a valid token on Git-over-HTTPS with "Invalid
+ * username or token", and the same request succeeds moments later, so fetches
+ * are retried with these delays.
+ */
+const fetchRetryDelaysMs = [2_000, 5_000];
+
+export function isAuthenticationFailure(stderr: string): boolean {
+  return /Invalid username or (token|password)|Authentication failed/i.test(stderr);
+}
+
+export function isRetryableFetchFailure(stderr: string): boolean {
+  return !/couldn't find remote ref|Repository not found/i.test(stderr);
+}
+
+/**
+ * Asks the REST API whether the same token can read the repository, so an
+ * authentication failure in the log shows whether GitHub rejected the token
+ * everywhere or only on the Git endpoint. It never throws and never prints the token.
+ */
+export async function probeGitHubToken(githubUrl: string, token: string): Promise<string> {
+  const match = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/i.exec(githubUrl);
+  if (!match) return "GitHub API check skipped: could not parse owner and repository from the URL";
+  const [, owner, repository] = match;
+  try {
+    const response = await fetch(`https://api.github.com/repos/${owner}/${repository}`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "qa-buddy"
+      },
+      signal: AbortSignal.timeout(5_000)
+    });
+    const header = (name: string) => response.headers.get(name) ?? "unknown";
+    return (
+      `GitHub API check: HTTP ${response.status} for ${owner}/${repository}` +
+      ` (request id ${header("x-github-request-id")}, rate limit remaining ${header("x-ratelimit-remaining")},` +
+      ` token expires ${header("github-authentication-token-expiration")})`
+    );
+  } catch (error) {
+    return `GitHub API check failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 export async function cloneRepository(options: {
   githubUrl: string;
   ref: string;
@@ -63,21 +107,40 @@ export async function cloneRepository(options: {
     timeoutMs: options.timeoutMs(),
     display: `git remote add origin ${options.githubUrl}`
   });
-  try {
-    await runProcess({
-      command: "git",
-      args: ["fetch", "--depth=1", "origin", options.ref],
-      cwd: repositoryDirectory,
-      env: gitEnvironment,
-      logger: options.logger,
-      timeoutMs: options.timeoutMs(),
-      display: `git fetch --depth=1 origin ${options.ref}`
-    });
-  } catch (error) {
-    if (error instanceof ProcessError) {
-      throw new ProcessError(githubFetchFailureMessage(Boolean(options.githubToken)), error.exitCode);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await runProcess({
+        command: "git",
+        args: ["fetch", "--depth=1", "origin", options.ref],
+        cwd: repositoryDirectory,
+        env: gitEnvironment,
+        logger: options.logger,
+        timeoutMs: options.timeoutMs(),
+        display: `git fetch --depth=1 origin ${options.ref}`
+      });
+      if (attempt > 0) options.logger.line(`GitHub fetch succeeded on retry ${attempt}`);
+      break;
+    } catch (error) {
+      if (!(error instanceof ProcessError)) throw error;
+      if (options.githubToken && isAuthenticationFailure(error.stderr)) {
+        options.logger.line(await probeGitHubToken(options.githubUrl, options.githubToken));
+      }
+      const delayMs = fetchRetryDelaysMs[attempt];
+      // A timeout (null exit code) has spent the run budget, and a missing ref
+      // or repository will not appear on retry.
+      if (
+        delayMs === undefined ||
+        error.exitCode === null ||
+        !isRetryableFetchFailure(error.stderr) ||
+        delayMs >= options.timeoutMs()
+      ) {
+        throw new ProcessError(githubFetchFailureMessage(Boolean(options.githubToken)), error.exitCode, error.stderr);
+      }
+      options.logger.line(
+        `GitHub fetch failed (attempt ${attempt + 1} of ${fetchRetryDelaysMs.length + 1}); retrying in ${delayMs / 1000}s`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    throw error;
   }
   await runProcess({
     command: "git",

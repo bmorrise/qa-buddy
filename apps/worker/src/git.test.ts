@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { githubAuthenticationMessage, githubFetchFailureMessage, githubRegistryAuthenticationMessage } from "./git.js";
+import {
+  githubAuthenticationMessage,
+  githubFetchFailureMessage,
+  githubRegistryAuthenticationMessage,
+  isAuthenticationFailure,
+  isRetryableFetchFailure,
+  probeGitHubToken
+} from "./git.js";
 
 describe("GitHub clone authentication diagnostics", () => {
   it("shows only the first ten token characters with a masked suffix", () => {
@@ -50,5 +57,34 @@ describe("GitHub package registry authentication diagnostics", () => {
   it("reports a missing registry token", () => {
     expect(githubRegistryAuthenticationMessage()).toContain("GITHUB_IDP_REGISTRY is not configured");
     expect(githubRegistryAuthenticationMessage("")).toContain("GITHUB_IDP_REGISTRY is not configured");
+  });
+});
+
+describe("GitHub fetch failure classification", () => {
+  const invalidToken =
+    "remote: Invalid username or token. Password authentication is not supported for Git operations.\nfatal: Authentication failed for 'https://github.com/idplans/idplans-platform.git/'\n";
+
+  it("treats GitHub's intermittent invalid token response as a retryable authentication failure", () => {
+    expect(isAuthenticationFailure(invalidToken)).toBe(true);
+    expect(isRetryableFetchFailure(invalidToken)).toBe(true);
+  });
+
+  it("retries network errors without probing the token", () => {
+    const stderr = "fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com\n";
+    expect(isAuthenticationFailure(stderr)).toBe(false);
+    expect(isRetryableFetchFailure(stderr)).toBe(true);
+  });
+
+  it.each([
+    "fatal: couldn't find remote ref missing-branch\n",
+    "remote: Repository not found.\nfatal: repository 'https://github.com/a/b.git/' not found\n"
+  ])("does not retry permanent failures (%s)", (stderr) => {
+    expect(isRetryableFetchFailure(stderr)).toBe(false);
+  });
+});
+
+describe("GitHub API token probe", () => {
+  it("skips URLs it cannot parse without making a request", async () => {
+    await expect(probeGitHubToken("https://example.com/repo.git", "token")).resolves.toContain("skipped");
   });
 });
