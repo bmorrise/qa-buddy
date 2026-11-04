@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatLineRanges,
   normalizeCoverageFilePath,
+  parseIstanbulDetails,
   parseIstanbulReport,
   parseIstanbulSummary,
   parseLcov,
-  parseLcovReport
+  parseLcovDetails,
+  parseLcovReport,
+  toLineRanges
 } from "./coverage.js";
 
 describe("coverage parsers", () => {
@@ -181,5 +185,81 @@ describe("per-file LCOV coverage", () => {
 
   it("keeps the original summary-only helper working", () => {
     expect(parseLcov(report).lines).toEqual({ covered: 1, total: 3, percent: 33.3 });
+  });
+});
+
+describe("coverage gap details", () => {
+  it("collapses lines into ranges and formats them", () => {
+    expect(toLineRanges([9, 3, 4, 5, 9, 12, 0, -1])).toEqual([[3, 5], [9, 9], [12, 12]]);
+    expect(formatLineRanges([[3, 5], [9, 9]])).toBe("3-5, 9");
+  });
+
+  it("reads uncovered lines, functions, and branches from Istanbul's detailed report", () => {
+    const report = {
+      "/workspaces/run-1/repo/apps/api/src/users.ts": {
+        path: "/workspaces/run-1/repo/apps/api/src/users.ts",
+        statementMap: {
+          "0": { start: { line: 1 }, end: { line: 1 } },
+          "1": { start: { line: 4 }, end: { line: 4 } },
+          "2": { start: { line: 5 }, end: { line: 5 } },
+          "3": { start: { line: 6 }, end: { line: 6 } },
+          // A covered statement on line 9 keeps the line covered despite a missed one.
+          "4": { start: { line: 9 }, end: { line: 9 } },
+          "5": { start: { line: 9 }, end: { line: 9 } }
+        },
+        s: { "0": 3, "1": 0, "2": 0, "3": 0, "4": 1, "5": 0 },
+        fnMap: {
+          "0": { name: "findUser", decl: { start: { line: 1 } }, loc: { start: { line: 1 } } },
+          "1": { name: "removeUser", decl: { start: { line: 4 } }, loc: { start: { line: 4 } } },
+          "2": { name: "", decl: { start: { line: 12 } } }
+        },
+        f: { "0": 2, "1": 0, "2": 0 },
+        branchMap: {
+          "0": { type: "if", loc: { start: { line: 2 } }, locations: [{}, {}] },
+          "1": { type: "cond-expr", loc: { start: { line: 9 } }, locations: [{}, {}] },
+          "2": { type: "switch", loc: { start: { line: 14 } }, locations: [{}, {}, {}] }
+        },
+        b: { "0": [1, 0], "1": [2, 3], "2": [0, 0, 1] }
+      }
+    };
+    const details = parseIstanbulDetails(JSON.stringify(report), { rootDirectory: "/workspaces/run-1/repo" });
+    expect(details.get("apps/api/src/users.ts")).toEqual({
+      uncoveredLines: [[4, 6]],
+      uncoveredFunctions: [
+        { name: "removeUser", line: 4 },
+        { name: "(anonymous)", line: 12 }
+      ],
+      uncoveredBranches: [
+        { line: 2, type: "if", uncovered: 1, total: 2 },
+        { line: 14, type: "switch", uncovered: 2, total: 3 }
+      ]
+    });
+  });
+
+  it("reads gaps from LCOV", () => {
+    const lcov = [
+      "SF:apps/api/src/users.ts",
+      "FN:3,findUser",
+      "FN:10,removeUser",
+      "FNDA:4,findUser",
+      "FNDA:0,removeUser",
+      "DA:3,4",
+      "DA:10,0",
+      "DA:11,0",
+      "DA:14,0",
+      "BRDA:5,0,0,2",
+      "BRDA:5,0,1,0",
+      "BRDA:7,1,0,-",
+      "BRDA:7,1,1,-",
+      "end_of_record"
+    ].join("\n");
+    expect(parseLcovDetails(lcov).get("apps/api/src/users.ts")).toEqual({
+      uncoveredLines: [[10, 11], [14, 14]],
+      uncoveredFunctions: [{ name: "removeUser", line: 10 }],
+      uncoveredBranches: [
+        { line: 5, type: "branch", uncovered: 1, total: 2 },
+        { line: 7, type: "branch", uncovered: 2, total: 2 }
+      ]
+    });
   });
 });

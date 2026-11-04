@@ -773,3 +773,15 @@ details[open] > summary .slice-setup-title > svg { transform: rotate(90deg); }
 .slice-unmatched > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 25px; cursor: pointer; list-style: none; }
 .slice-unmatched > summary::-webkit-details-marker { display: none; }
 .slice-unmatched-copy { padding: 0 25px 14px; margin: 0; line-height: 1.7; }
+
+/* Per-file coverage gaps */
+.file-gaps-toggle { display: inline-block; margin-left: 10px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.file-row-open > td { border-bottom-color: transparent; }
+.file-gaps-row > td { background: #fbfaff; padding-top: 4px; }
+.file-gaps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 20px; margin: 0; padding: 4px 4px 10px; }
+.file-gaps dt { font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: #8a8295; margin-bottom: 6px; }
+.file-gaps dd { margin: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.file-gaps code { padding: 3px 7px; border: 1px solid #ebe7f4; border-radius: 6px; background: #fff; font-size: 11px; }
+.file-gaps code small { color: var(--faint); }
+.file-gaps-message { margin: 0; padding: 6px 4px 10px; font-size: 12px; }
+@media (max-width: 760px) { .file-gaps { grid-template-columns: 1fr; } }

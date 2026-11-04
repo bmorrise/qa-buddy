@@ -56,7 +56,8 @@ function stubFetch(overview: SliceOverview, extra: Record<string, unknown> = {})
       else if (url.endsWith("/slices/builds")) body = { build: { id: "build-2" } };
       else if (url.endsWith("/slices/history")) body = { entries: [] };
       else if (url.endsWith("/slices")) body = overview;
-      else if (url.includes("/coverage/files")) body = { files: [], total: 0, limit: 15, offset: 0 };
+      else if (url.includes("/coverage/files")) body = extra["/coverage/files"] ?? { files: [], total: 0, limit: 15, offset: 0 };
+      else if (url.includes("/coverage/file?")) body = extra["/coverage/file"];
       else {
         const match = Object.keys(extra).find((key) => url.endsWith(key));
         body = match ? extra[match] : { repository: { id: repositoryId, name: "Platform", localPath: null, coverageGoal: 60 } };
@@ -196,5 +197,49 @@ describe("pizza wedge", () => {
     expect(wedgePath(50, 50, 40, 50)).toContain("A 40 40 0 0 1");
     expect(wedgePath(50, 50, 40, 75)).toContain("A 40 40 0 1 1");
     expect(wedgePath(50, 50, 40, 100)).not.toContain("L");
+  });
+});
+
+describe("file gaps", () => {
+  it("shows a file's uncovered functions, lines, and branches when expanded", async () => {
+    const detail: SliceDetail = { ...slice, endpoints: [], unmatchedCalls: [] };
+    const fileMetric = metric(3, 10);
+    const requests = stubFetch(
+      { config, builds: [], slices: [slice] },
+      {
+        "/slices/idinspect": { slice: detail },
+        "/coverage/files": {
+          files: [{ appName: "@acme/api", path: "apps/api/src/users.service.ts", lines: fileMetric, statements: fileMetric, functions: fileMetric, branches: fileMetric }],
+          total: 1,
+          limit: 15,
+          offset: 0
+        },
+        "/coverage/file": {
+          file: {
+            appName: "@acme/api",
+            path: "apps/api/src/users.service.ts",
+            lines: fileMetric,
+            statements: fileMetric,
+            functions: fileMetric,
+            branches: fileMetric,
+            details: {
+              uncoveredLines: [[12, 18], [40, 40]],
+              uncoveredFunctions: [{ name: "removeUser", line: 12 }],
+              uncoveredBranches: [{ line: 30, type: "if", uncovered: 1, total: 2 }]
+            },
+            snapshot: { runId: "run-1", resolvedSha: "abc", capturedAt: "2026-11-04T11:00:00.000Z" }
+          }
+        }
+      }
+    );
+    renderAt(`/repositories/${repositoryId}/slices/idinspect`);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Show gaps" }));
+    expect(await screen.findByText("12-18, 40")).toBeTruthy();
+    expect(screen.getByText(/removeUser/)).toBeTruthy();
+    expect(screen.getByText(/1 of 2 paths missed/)).toBeTruthy();
+    expect(requests.calls.some((call) => call.url.endsWith("/coverage/file?path=apps%2Fapi%2Fsrc%2Fusers.service.ts"))).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Hide gaps" }));
+    expect(screen.queryByText("12-18, 40")).toBeNull();
   });
 });

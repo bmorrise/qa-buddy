@@ -8,6 +8,8 @@ import type {
   AppGroupInput,
   AppRun,
   AppRunStatus,
+  CoverageFileDetail,
+  CoverageFileDetails,
   CoverageFileEntry,
   CoverageFilePage,
   CoverageFileQuery,
@@ -368,6 +370,11 @@ const migrations = [
       UPDATE slices SET backends_json = json_array(json_object('directory', backend_directory, 'endpointCount', endpoint_count));
       ALTER TABLE slices ADD COLUMN unmatched_calls_json TEXT NOT NULL DEFAULT '[]';
     `
+  },
+  {
+    version: 19,
+    // Where each file's gaps are: uncovered line ranges, functions, and branches.
+    sql: "ALTER TABLE coverage_files ADD COLUMN details_json TEXT;"
   }
 ] as const;
 
@@ -476,6 +483,7 @@ interface CoverageFileRowRecord {
   app_name: string;
   snapshot_id: string;
   file_path: string;
+  details_json?: string | null;
   lines_covered: number | null;
   lines_total: number | null;
   statements_covered: number | null;
@@ -1177,8 +1185,8 @@ export class QaBuddyDatabase {
         INSERT INTO coverage_files(
           snapshot_id, file_path,
           lines_covered, lines_total, statements_covered, statements_total,
-          functions_covered, functions_total, branches_covered, branches_total
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          functions_covered, functions_total, branches_covered, branches_total, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const file of values.files) {
         statement.run(
@@ -1191,10 +1199,31 @@ export class QaBuddyDatabase {
           file.functions?.covered ?? null,
           file.functions?.total ?? null,
           file.branches?.covered ?? null,
-          file.branches?.total ?? null
+          file.branches?.total ?? null,
+          file.details ? JSON.stringify(file.details) : null
         );
       }
     })();
+  }
+
+  /** One file's current coverage and gap details, or null when no snapshot lists it. */
+  getCoverageFile(repositoryId: string, filePath: string): CoverageFileDetail | null {
+    const row = this.connection
+      .prepare(`
+        SELECT s.app_name, s.run_id, s.resolved_sha, s.captured_at, f.* FROM coverage_files f
+        JOIN coverage_snapshots s ON s.id = f.snapshot_id
+        WHERE s.repository_id = ? AND f.file_path = ?
+        ORDER BY s.captured_at DESC LIMIT 1
+      `)
+      .get(repositoryId, filePath) as
+      | (CoverageFileRowRecord & { run_id: string | null; resolved_sha: string | null; captured_at: string })
+      | undefined;
+    if (!row) return null;
+    return {
+      ...this.mapCoverageFileRow(row),
+      details: row.details_json ? (JSON.parse(row.details_json) as CoverageFileDetails) : null,
+      snapshot: { runId: row.run_id, resolvedSha: row.resolved_sha, capturedAt: row.captured_at }
+    };
   }
 
   listCoverageSnapshots(repositoryId: string): CoverageSnapshot[] {
@@ -1252,7 +1281,11 @@ export class QaBuddyDatabase {
     });
   }
 
-  queryCoverageFiles(repositoryId: string, query: CoverageFileQuery = {}): CoverageFilePage {
+  queryCoverageFiles(
+    repositoryId: string,
+    query: CoverageFileQuery = {},
+    options: { includeDetails?: boolean } = {}
+  ): CoverageFilePage {
     const metric: CoverageMetricName = coverageMetricNames.includes(query.metric as CoverageMetricName)
       ? (query.metric as CoverageMetricName)
       : "lines";
@@ -1305,7 +1338,18 @@ export class QaBuddyDatabase {
       `)
       .all(...parameters, limit, offset) as CoverageFileRowRecord[];
 
-    return { files: rows.map((row) => this.mapCoverageFileRow(row)), total, limit, offset };
+    return {
+      files: rows.map((row) => {
+        const file = this.mapCoverageFileRow(row);
+        // Paged lists stay lean; exports ask for the gap details.
+        return options.includeDetails
+          ? { ...file, details: row.details_json ? (JSON.parse(row.details_json) as CoverageFileDetails) : null }
+          : file;
+      }),
+      total,
+      limit,
+      offset
+    };
   }
 
   updateRun(
@@ -2004,7 +2048,7 @@ export class QaBuddyDatabase {
 
     const files: CoverageExportRow[] = [];
     for (let offset = 0; ; offset += 1_000) {
-      const page = this.queryCoverageFiles(repositoryId, { ...query, limit: 1_000, offset });
+      const page = this.queryCoverageFiles(repositoryId, { ...query, limit: 1_000, offset }, { includeDetails: true });
       for (const file of page.files) files.push({ ...file, slices: membership.get(file.path) ?? [] });
       if (offset + page.files.length >= page.total || page.files.length === 0) break;
     }

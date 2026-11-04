@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { QaBuddyDatabase } from "@qa-buddy/db";
-import { buildServer } from "./server.js";
+import { apiEndpoints } from "./api-reference.js";
+import { buildServer, registeredApiRoutes } from "./server.js";
 
 const repositoryInput = {
   name: "Platform",
@@ -178,16 +179,16 @@ describe("slice API", () => {
     expect(csv.headers["content-type"]).toContain("text/csv");
     expect(csv.headers["content-disposition"]).toMatch(/attachment; filename="platform-inspect-coverage-files-\d{4}-\d{2}-\d{2}\.csv"/);
     expect(csv.body.split("\r\n")).toEqual([
-      "file,app,slices,lines_percent,lines_covered,lines_total,statements_percent,statements_covered,statements_total,functions_percent,functions_covered,functions_total,branches_percent,branches_covered,branches_total",
-      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2',
+      "file,app,slices,lines_percent,lines_covered,lines_total,statements_percent,statements_covered,statements_total,functions_percent,functions_covered,functions_total,branches_percent,branches_covered,branches_total,uncovered_functions,uncovered_lines",
+      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2,,',
       ""
     ]);
 
     // A file in several slices keeps them in one quoted cell, whatever separator the spreadsheet assumes.
     const shared = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?slice=scout` });
     expect(shared.body.split("\r\n").slice(1, 3)).toEqual([
-      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2',
-      '"apps/api/src/c;d.ts",@acme/api,scout,75,3,4,,,,100,1,1,100,2,2'
+      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2,,',
+      '"apps/api/src/c;d.ts",@acme/api,scout,75,3,4,,,,100,1,1,100,2,2,,'
     ]);
 
     const json = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=json&metric=lines&maxPercent=0` });
@@ -199,5 +200,47 @@ describe("slice API", () => {
     const all = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=json` });
     expect(all.json().total).toBe(1_207);
     expect((await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=xml` })).statusCode).toBe(400);
+  });
+
+  it("publishes an API reference that lists exactly the registered routes", async () => {
+    const response = await app.inject({ method: "GET", url: "/api" });
+    expect(response.json().endpoints).toEqual(apiEndpoints);
+    const key = (route: { method: string; path: string }) => `${route.method} ${route.path}`;
+    expect(apiEndpoints.map(key).sort()).toEqual(registeredApiRoutes(app).map(key).sort());
+  });
+
+  it("serves one file's gaps and adds them to the CSV", async () => {
+    const metric = { covered: 1, total: 4, percent: 25 };
+    database.replaceCoverageSnapshot(repositoryId, "@acme/api", {
+      runId: "run-1",
+      resolvedSha: "def456",
+      coverageFormat: "istanbul-summary-json",
+      coveragePath: null,
+      summary: { lines: metric, statements: metric, functions: metric, branches: metric },
+      files: [
+        {
+          path: "apps/api/src/users.ts",
+          lines: metric,
+          statements: metric,
+          functions: metric,
+          branches: metric,
+          details: {
+            uncoveredLines: [[4, 6], [9, 9]],
+            uncoveredFunctions: [{ name: "remove", line: 4 }, { name: "rename", line: 9 }],
+            uncoveredBranches: [{ line: 5, type: "if", uncovered: 1, total: 2 }]
+          }
+        }
+      ]
+    });
+
+    const found = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/file?path=apps/api/src/users.ts` });
+    expect(found.json().file).toMatchObject({ appName: "@acme/api", details: { uncoveredFunctions: [{ name: "remove" }, { name: "rename" }] } });
+    expect((await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/file?path=nope.ts` })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/file` })).statusCode).toBe(400);
+
+    const csv = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export` });
+    const [header, row] = csv.body.split("\r\n");
+    expect(header!.endsWith(",uncovered_functions,uncovered_lines")).toBe(true);
+    expect(row!.endsWith(',"remove (line 4), rename (line 9)","4-6, 9"')).toBe(true);
   });
 });

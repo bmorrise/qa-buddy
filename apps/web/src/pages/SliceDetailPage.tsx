@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { CoverageFilePage, CoverageMetric, CoverageMetricName, Repository, SliceDetail } from "@qa-buddy/shared";
 import { api } from "../api";
+import { FileRowWithGaps } from "../components/FileGaps";
 import { Icon } from "../components/Icon";
 import { Loading } from "../components/Loading";
 import { coverageTone, Pizza } from "../components/Pizza";
@@ -175,13 +176,12 @@ export function SliceDetailPage() {
               <thead><tr><th>File</th><th>Lines</th><th>Statements</th><th>Functions</th><th>Branches</th></tr></thead>
               <tbody>
                 {weakest?.files.map((file) => (
-                  <tr key={file.path}>
-                    <td><code className="gap-path">{file.path}</code></td>
+                  <FileRowWithGaps key={file.path} repositoryId={repository.id} path={file.path} columnCount={5}>
                     <td><FileMetric value={file.lines} /></td>
                     <td><FileMetric value={file.statements} /></td>
                     <td><FileMetric value={file.functions} /></td>
                     <td><FileMetric value={file.branches} /></td>
-                  </tr>
+                  </FileRowWithGaps>
                 ))}
               </tbody>
             </table>

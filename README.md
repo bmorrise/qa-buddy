@@ -54,7 +54,7 @@ Enable **Auto-detect pnpm/Turborepo apps** when the repository has a root `pnpm-
 2. Prioritizes workspaces under `apps/`; if there is no `apps/` group, it considers all workspaces.
 3. Reads each workspace `package.json` and selects `test:coverage`, then `test:cov`, `coverage`, and finally `test` in that order.
 4. Runs the selected script from that app's workspace directory.
-5. Adds Jest or Vitest's JSON test reporter, requires an Istanbul-compatible JSON coverage summary for both runners, and records exact passed, failed, skipped, and todo test cases.
+5. Adds Jest or Vitest's JSON test reporter, requires an Istanbul-compatible JSON coverage summary for both runners, also asks for Istanbul's detailed `coverage-final.json` report (the source of per-file gap locations), and records exact passed, failed, skipped, and todo test cases.
 6. Limits parallel Jest and Vitest workers to the configured per-app value, preserves serial Jest scripts, uses version-compatible Vitest worker flags, and ignores compiled `dist` output during Jest coverage collection.
 7. Clears that app's old structured-test and coverage files before execution, then discovers newly generated `coverage/coverage-summary.json` or `coverage/lcov.info`, including repository-root `coverage/apps/...` layouts and both JSON/LCOV files in safe shared Jest `coverageDirectory` values from package.json. This prevents a failed app from inheriting another app's shared or stale report.
 
@@ -193,6 +193,8 @@ The view ranks by branch coverage by default, because branches are where unteste
 
 Istanbul summary reports provide lines, statements, functions, and branches per file. LCOV provides lines, functions, and branches; statements are `N/A` because LCOV does not define a separate statement metric.
 
+Select **Show gaps** on any file row to see where its gaps are: functions never called (with their line), line ranges that never ran, and branch points where some paths were never taken. Gap details come from Istanbul's detailed report (`coverage-final.json`, requested automatically for auto-detected Jest and Vitest apps; for manually configured apps, add the `json` coverage reporter next to `json-summary`) or from LCOV. Snapshots captured before this was added show none until the app's next run.
+
 Coverage percentage identifies lines that never executed, not behaviour that was never considered. A file at 100% line coverage with weak assertions still looks complete here. Treat zero-coverage files and low branch coverage as leads to investigate rather than a finished verdict.
 
 When a repository has slices, a **Slice** filter narrows the list to one slice's backend files. Slice pages link here with the filter already applied. **CSV** and **JSON** links download every file matching the current filters; see [Exporting files](#exporting-files).
@@ -266,13 +268,54 @@ Rebaking is only needed when **which files belong to a slice** may have changed,
 
 ### Exporting files
 
-Coverage gaps and each slice's **Files to improve** panel offer **CSV** and **JSON** downloads of every matching file, unpaged, with each metric's percent, covered, and total counts and the slices that include each file. Exports follow the filters on screen. The same data is available directly:
+Coverage gaps and each slice's **Files to improve** panel offer **CSV** and **JSON** downloads of every matching file, unpaged, with each metric's percent, covered, and total counts, the slices that include each file, and its gaps (uncovered functions and line ranges; JSON also lists partly taken branches). Exports follow the filters on screen. The same data is available directly:
 
 ```bash
 curl -OJ 'http://localhost:3003/api/repositories/<repository-id>/coverage/files/export?slice=idinspect&metric=branches&format=csv'
 ```
 
 Not yet supported: Ember apps and Ember Data adapters, whose request URLs are built from model names at runtime, and backend frameworks other than NestJS and Express. See [docs/ideas.md](docs/ideas.md) for planned extensions.
+
+## API for scripts and agents
+
+Everything the dashboard shows comes from a JSON API on the same port, so scripts, notebooks, and AI agents can read it directly. `GET /api` lists every endpoint with a one-line summary and its query parameters; it is generated from the same list the server registers, so it stays current.
+
+```bash
+curl -s http://localhost:3003/api | jq '.endpoints[] | "\(.method) \(.path)"'
+```
+
+Common recipes:
+
+```bash
+BASE=http://localhost:3003
+# Find a repository id by name.
+REPO=$(curl -s $BASE/api/repositories | jq -r '.repositories[] | select(.name == "idplans-platform") | .id')
+
+# Every slice with current coverage, per backend.
+curl -s "$BASE/api/repositories/$REPO/slices" | jq '.slices[] | {name, branches: .coverage.branches.percent, backends: [.backends[] | {directory, branches: .coverage.branches.percent}]}'
+
+# One slice's endpoints and unmatched requests.
+curl -s "$BASE/api/repositories/$REPO/slices/idinspect" | jq '.slice | {endpoints: (.endpoints | length), unmatchedCalls}'
+
+# The weakest files in a slice, with where their gaps are.
+curl -s "$BASE/api/repositories/$REPO/coverage/files/export?slice=idinspect&metric=branches&format=json" \
+  | jq '.files[:10][] | {path, branches: .branches.percent, functions: [.details.uncoveredFunctions[]?.name], lines: .details.uncoveredLines}'
+
+# One file's gaps.
+curl -s "$BASE/api/repositories/$REPO/coverage/file?path=apps/idp-api-service/src/user/user.service.ts" | jq '.file.details'
+```
+
+Things worth knowing when reading the data:
+
+- Per-file coverage and gaps come from each app's **latest snapshot**, which only GitHub-ref runs update. Compare `snapshot.resolvedSha` (or a slice's `coverageSha`) with your checkout before treating a gap as current.
+- Slices reflect the commit they were baked from (`resolvedSha`); rebake after endpoint or module changes.
+- Queuing runs (`POST /runs`) and slice builds (`POST /slices/builds`) starts real work on the worker; read-only use never changes anything.
+
+A Claude Code skill in [`.claude/skills/qa-buddy`](.claude/skills/qa-buddy/SKILL.md) teaches agents these recipes. It loads automatically for sessions started in this repository. To use it from any directory, such as a checkout of a repository QA Buddy measures, link it into your user skills:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$(pwd)/.claude/skills/qa-buddy" ~/.claude/skills/qa-buddy
+```
 
 ## Architecture and security
 

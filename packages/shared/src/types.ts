@@ -84,12 +84,27 @@ export interface CoverageSummary {
   branches: CoverageMetric | null;
 }
 
+/**
+ * Where a file's coverage gaps are, from Istanbul's detailed report or LCOV.
+ * Lists are capped per file, so a very large file reports its first gaps.
+ */
+export interface CoverageFileDetails {
+  /** Inclusive line ranges with no executed statement, for example `[[12, 18], [40, 40]]`. */
+  uncoveredLines: Array<[number, number]>;
+  /** Functions never called, with the line they are declared on. */
+  uncoveredFunctions: Array<{ name: string; line: number }>;
+  /** Branch points with at least one path never taken. */
+  uncoveredBranches: Array<{ line: number; type: string; uncovered: number; total: number }>;
+}
+
 export interface CoverageFileEntry {
   path: string;
   lines: CoverageMetric | null;
   statements: CoverageMetric | null;
   functions: CoverageMetric | null;
   branches: CoverageMetric | null;
+  /** Present when the run produced a detailed report; absent for summary-only reports. */
+  details?: CoverageFileDetails | null;
 }
 
 export interface CoverageReport {
@@ -158,6 +173,12 @@ export interface CoverageFileRow extends CoverageFileEntry {
 /** A coverage file row in an export, with the slices that include it. */
 export interface CoverageExportRow extends CoverageFileRow {
   slices: string[];
+}
+
+/** One file's coverage, gaps, and the snapshot it came from. */
+export interface CoverageFileDetail extends CoverageFileRow {
+  details: CoverageFileDetails | null;
+  snapshot: { runId: string | null; resolvedSha: string | null; capturedAt: string };
 }
 
 export interface CoverageFilePage {

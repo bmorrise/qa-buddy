@@ -260,6 +260,23 @@ describe("slices", () => {
     ]);
   });
 
+  it("stores gap details, serves them per file, and includes them in exports only", () => {
+    const details = { uncoveredLines: [[4, 6]] as Array<[number, number]>, uncoveredFunctions: [{ name: "remove", line: 4 }], uncoveredBranches: [] };
+    snapshot("@acme/api", "run-1", [{ ...file("apps/api/src/shared.ts", 6, 10), details }, file("apps/api/src/plain.ts", 1, 1)]);
+
+    expect(database.getCoverageFile(repositoryId, "apps/api/src/shared.ts")).toMatchObject({
+      appName: "@acme/api",
+      lines: { covered: 6, total: 10 },
+      details,
+      snapshot: { runId: "run-1", resolvedSha: "def456" }
+    });
+    expect(database.getCoverageFile(repositoryId, "apps/api/src/plain.ts")!.details).toBeNull();
+    expect(database.getCoverageFile(repositoryId, "apps/api/src/missing.ts")).toBeNull();
+
+    expect(database.queryCoverageFiles(repositoryId).files[0]).not.toHaveProperty("details");
+    expect(database.exportCoverageFiles(repositoryId).find((row) => row.path === "apps/api/src/shared.ts")!.details).toEqual(details);
+  });
+
   it("sums coverage only from files that report each metric", () => {
     expect(sumCoverage([])).toEqual({ lines: null, statements: null, functions: null, branches: null });
     expect(

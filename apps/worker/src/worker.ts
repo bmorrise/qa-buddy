@@ -12,7 +12,7 @@ import {
   type RunDetail,
   type TestResults
 } from "@qa-buddy/shared";
-import { clearAppReports, detectPnpmWorkspaceApps, discoverCoverageReport } from "./detection.js";
+import { attachCoverageDetails, clearAppReports, detectPnpmWorkspaceApps, discoverCoverageReport } from "./detection.js";
 import { cleanupOrphanRunners, CommandTimeoutError, DockerRunner, RunnerTimeoutError } from "./docker-runner.js";
 import {
   archiveLocalWorkingTree,
@@ -168,7 +168,12 @@ export class QaBuddyWorker {
         : parseIstanbulReport(contents, parseOptions);
     return {
       coverage: report.summary,
-      coverageFiles: report.files,
+      coverageFiles: attachCoverageDetails(
+        repositoryDirectory,
+        appRun.workingDirectory,
+        { format: appRun.coverageFormat, path: appRun.coveragePath, contents },
+        report.files
+      ),
       coverageFormat: appRun.coverageFormat,
       coveragePath: appRun.coveragePath
     };

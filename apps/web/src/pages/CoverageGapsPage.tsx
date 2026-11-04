@@ -9,6 +9,7 @@ import type {
 } from "@qa-buddy/shared";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { FileRowWithGaps } from "../components/FileGaps";
 import { Icon } from "../components/Icon";
 import { Loading } from "../components/Loading";
 
@@ -268,14 +269,18 @@ export function CoverageGapsPage() {
                   </thead>
                   <tbody>
                     {page?.files.map((file) => (
-                      <tr key={`${file.appName}:${file.path}`}>
-                        <td><code className="gap-path">{file.path}</code></td>
+                      <FileRowWithGaps
+                        key={`${file.appName}:${file.path}`}
+                        repositoryId={repositoryId}
+                        path={file.path}
+                        columnCount={appName === "" ? 6 : 5}
+                      >
                         {appName === "" && <td>{file.appName}</td>}
                         <td><Metric value={file.lines} /></td>
                         <td><Metric value={file.statements} /></td>
                         <td><Metric value={file.functions} /></td>
                         <td><Metric value={file.branches} /></td>
-                      </tr>
+                      </FileRowWithGaps>
                     ))}
                   </tbody>
                 </table>

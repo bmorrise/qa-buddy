@@ -10,6 +10,7 @@ import {
   coverageExportQuerySchema,
   coverageFileQuerySchema,
   coverageMetricNames,
+  formatLineRanges,
   type CoverageExportRow,
   repositoryInputSchema,
   runRequestSchema,
@@ -17,6 +18,7 @@ import {
   sliceConfigSchema,
   terminalRunStatuses
 } from "@qa-buddy/shared";
+import { apiEndpoints } from "./api-reference.js";
 import { initialLogOffset, readLogChunk } from "./log-stream.js";
 
 export interface ServerOptions {
@@ -53,7 +55,9 @@ export function coverageFilesCsv(files: CoverageExportRow[]): string {
     "file",
     "app",
     "slices",
-    ...coverageMetricNames.flatMap((metric) => [`${metric}_percent`, `${metric}_covered`, `${metric}_total`])
+    ...coverageMetricNames.flatMap((metric) => [`${metric}_percent`, `${metric}_covered`, `${metric}_total`]),
+    "uncovered_functions",
+    "uncovered_lines"
   ];
   const rows = files.map((file) => [
     file.path,
@@ -62,7 +66,9 @@ export function coverageFilesCsv(files: CoverageExportRow[]): string {
     ...coverageMetricNames.flatMap((metric) => {
       const value = file[metric];
       return value ? [value.percent, value.covered, value.total] : [null, null, null];
-    })
+    }),
+    file.details ? file.details.uncoveredFunctions.map((fn) => `${fn.name} (line ${fn.line})`).join(", ") : null,
+    file.details ? formatLineRanges(file.details.uncoveredLines) : null
   ]);
   return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
 }
@@ -75,11 +81,32 @@ function logPath(dataDirectory: string, runId: string): string {
   return path.join(dataDirectory, "logs", `${runId}.log`);
 }
 
+const registeredRoutes = new WeakMap<FastifyInstance, Array<{ method: string; path: string }>>();
+
+/** API routes the server registered, for checking the published reference. */
+export function registeredApiRoutes(app: FastifyInstance): Array<{ method: string; path: string }> {
+  return registeredRoutes.get(app) ?? [];
+}
+
 export async function buildServer(options: ServerOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false });
+  const routes: Array<{ method: string; path: string }> = [];
+  registeredRoutes.set(app, routes);
+  app.addHook("onRoute", (route) => {
+    if (!route.url.startsWith("/api")) return;
+    for (const method of Array.isArray(route.method) ? route.method : [route.method]) {
+      if (method !== "HEAD") routes.push({ method, path: route.url });
+    }
+  });
   const { database } = options;
 
   app.get("/api/health", async () => ({ status: "ok", service: "qa-buddy" }));
+
+  app.get("/api", async () => ({
+    service: "qa-buddy",
+    description: "Local test-run and coverage dashboard. Paths are relative to this server; ids come from /api/repositories.",
+    endpoints: apiEndpoints
+  }));
 
   app.get("/api/repositories", async () => ({ repositories: database.listRepositories() }));
 
@@ -311,6 +338,24 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
         .type("text/csv; charset=utf-8")
         .header("content-disposition", `attachment; filename="${name}.csv"`)
         .send(coverageFilesCsv(files));
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string }; Querystring: { path?: string } }>(
+    "/api/repositories/:repositoryId/coverage/file",
+    async (request, reply) => {
+      if (!database.getRepository(request.params.repositoryId)) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const filePath = request.query.path?.trim();
+      if (!filePath) {
+        return reply.code(400).send({ error: "path: Enter a repository-relative file path" });
+      }
+      const file = database.getCoverageFile(request.params.repositoryId, filePath);
+      if (!file) {
+        return reply.code(404).send({ error: "No coverage snapshot lists this file" });
+      }
+      return { file };
     }
   );
 

@@ -3,7 +3,9 @@ import path from "node:path";
 import fg from "fast-glob";
 import { parse as parseYaml } from "yaml";
 import {
+  parseIstanbulDetails,
   parseIstanbulReport,
+  parseLcovDetails,
   parseLcovReport,
   type AppInput,
   type CoverageFileEntry,
@@ -79,7 +81,7 @@ function testCommand(
   const baseCommand = scriptName === "test" ? "pnpm test" : `pnpm run ${scriptName}`;
   if (script.includes("vitest")) {
     const enablesCoverage = /(^|\s)--coverage(?=\s|$|=)/.test(script);
-    const coverageArguments = `${enablesCoverage ? "" : " --coverage"} --coverage.reporter=json-summary --coverage.reportOnFailure`;
+    const coverageArguments = `${enablesCoverage ? "" : " --coverage"} --coverage.reporter=json-summary --coverage.reporter=json --coverage.reportOnFailure`;
     const vitestMajor = declaredDependencyMajor(manifest, "vitest");
     const workerArguments =
       vitestMajor !== null && vitestMajor >= 4
@@ -89,7 +91,7 @@ function testCommand(
   }
   if (script.includes("jest")) {
     const enablesCoverage = /(^|\s)--coverage(?=\s|$|=)/.test(script);
-    const coverageArguments = `${enablesCoverage ? "" : " --coverage"} --coverageReporters=json-summary`;
+    const coverageArguments = `${enablesCoverage ? "" : " --coverage"} --coverageReporters=json-summary --coverageReporters=json`;
     const runsSerially = /(^|\s)(--runinband|-i)(?=\s|$)/.test(script);
     const workerArguments = runsSerially
       ? ""
@@ -287,13 +289,49 @@ function containedReportPath(repositoryDirectory: string, relativePath: string):
   return reportPath.startsWith(`${repositoryRoot}${path.sep}`) ? reportPath : null;
 }
 
+/** Istanbul's detailed report next to a summary, which gap details come from. */
+export function detailedReportPath(summaryPath: string): string {
+  return path.posix.join(path.posix.dirname(summaryPath), DETAILED_REPORT_NAME);
+}
+
+const DETAILED_REPORT_NAME = "coverage-final.json";
+
+/**
+ * Adds gap details to parsed files: from the sibling `coverage-final.json` for
+ * an Istanbul summary, or from the LCOV report itself. A missing or unreadable
+ * detailed report leaves the files as they are.
+ */
+export function attachCoverageDetails(
+  repositoryDirectory: string,
+  workingDirectory: string,
+  report: { format: CoverageFormat; path: string; contents: string },
+  files: CoverageFileEntry[]
+): CoverageFileEntry[] {
+  const parseOptions = { rootDirectory: repositoryDirectory, workingDirectory };
+  try {
+    let details;
+    if (report.format === "lcov") {
+      details = parseLcovDetails(report.contents, parseOptions);
+    } else {
+      const detailedPath = containedReportPath(repositoryDirectory, detailedReportPath(report.path));
+      if (!detailedPath || !existsSync(detailedPath)) return files;
+      details = parseIstanbulDetails(readFileSync(detailedPath, "utf8"), parseOptions);
+    }
+    return files.map((file) => ({ ...file, details: details.get(file.path) ?? null }));
+  } catch {
+    return files;
+  }
+}
+
 export function clearAppReports(
   repositoryDirectory: string,
   workingDirectory: string,
   configuredCoveragePath?: string
 ): string[] {
+  const candidates = coverageCandidates(workingDirectory, configuredCoveragePath);
   const relativePaths = [
-    ...coverageCandidates(workingDirectory, configuredCoveragePath).map((candidate) => candidate.path),
+    ...candidates.map((candidate) => candidate.path),
+    ...candidates.filter((candidate) => candidate.format !== "lcov").map((candidate) => detailedReportPath(candidate.path)),
     path.posix.join(workingDirectory, TEST_RESULTS_FILE_NAME)
   ];
   const removed: string[] = [];
@@ -333,7 +371,12 @@ export function discoverCoverageReport(
         : parseIstanbulReport(contents, parseOptions);
     return {
       coverage: report.summary,
-      coverageFiles: report.files,
+      coverageFiles: attachCoverageDetails(
+        repositoryDirectory,
+        workingDirectory,
+        { format: candidate.format, path: candidate.path, contents },
+        report.files
+      ),
       coverageFormat: candidate.format,
       coveragePath: candidate.path
     };

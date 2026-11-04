@@ -1,4 +1,4 @@
-import type { CoverageFileEntry, CoverageMetric, CoverageReport, CoverageSummary } from "./types.js";
+import type { CoverageFileDetails, CoverageFileEntry, CoverageMetric, CoverageReport, CoverageSummary } from "./types.js";
 
 function metric(covered: number, total: number): CoverageMetric {
   return {
@@ -234,4 +234,181 @@ export function parseLcovReport(contents: string, options: CoverageParseOptions 
 
 export function parseLcov(contents: string): CoverageSummary {
   return parseLcovReport(contents).summary;
+}
+
+/** Per-file caps so one enormous file cannot bloat the snapshot. */
+export const COVERAGE_DETAIL_LIMITS = { lineRanges: 400, functions: 300, branches: 400 } as const;
+
+/** Collapses line numbers into sorted, inclusive ranges. */
+export function toLineRanges(lines: Iterable<number>): Array<[number, number]> {
+  const sorted = Array.from(new Set(lines)).filter((line) => Number.isInteger(line) && line > 0).sort((left, right) => left - right);
+  const ranges: Array<[number, number]> = [];
+  for (const line of sorted) {
+    const last = ranges[ranges.length - 1];
+    if (last && line === last[1] + 1) last[1] = line;
+    else ranges.push([line, line]);
+  }
+  return ranges;
+}
+
+/** `12-18, 40` style text for line ranges. */
+export function formatLineRanges(ranges: Array<[number, number]>): string {
+  return ranges.map(([start, end]) => (start === end ? String(start) : `${start}-${end}`)).join(", ");
+}
+
+function capDetails(details: CoverageFileDetails): CoverageFileDetails {
+  return {
+    uncoveredLines: details.uncoveredLines.slice(0, COVERAGE_DETAIL_LIMITS.lineRanges),
+    uncoveredFunctions: details.uncoveredFunctions.slice(0, COVERAGE_DETAIL_LIMITS.functions),
+    uncoveredBranches: details.uncoveredBranches.slice(0, COVERAGE_DETAIL_LIMITS.branches)
+  };
+}
+
+interface IstanbulLocation {
+  start?: { line?: unknown };
+}
+
+const startLine = (location: unknown): number | null => {
+  const line = (location as IstanbulLocation | undefined)?.start?.line;
+  return typeof line === "number" && Number.isInteger(line) && line > 0 ? line : null;
+};
+
+/**
+ * Reads gap locations from Istanbul's detailed report (`coverage-final.json`),
+ * keyed by normalized file path. A line counts as uncovered when statements
+ * start on it and none of them ran, matching Istanbul's own line metric.
+ */
+export function parseIstanbulDetails(
+  contents: string,
+  options: CoverageParseOptions = {}
+): Map<string, CoverageFileDetails> {
+  let document: unknown;
+  try {
+    document = JSON.parse(contents);
+  } catch {
+    throw new Error("Detailed coverage report is not valid JSON");
+  }
+  const result = new Map<string, CoverageFileDetails>();
+  if (!document || typeof document !== "object") return result;
+
+  for (const [key, value] of Object.entries(document as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const record = value as Record<string, unknown>;
+    const filePath = normalizeCoverageFilePath(typeof record.path === "string" ? record.path : key, options);
+    if (!filePath) continue;
+
+    const statementMap = (record.statementMap ?? {}) as Record<string, unknown>;
+    const statementHits = (record.s ?? {}) as Record<string, unknown>;
+    const coveredLines = new Set<number>();
+    const missedLines = new Set<number>();
+    for (const [id, location] of Object.entries(statementMap)) {
+      const line = startLine(location);
+      if (line === null) continue;
+      if (Number(statementHits[id]) > 0) coveredLines.add(line);
+      else missedLines.add(line);
+    }
+
+    const fnMap = (record.fnMap ?? {}) as Record<string, { name?: unknown; decl?: unknown; loc?: unknown; line?: unknown }>;
+    const fnHits = (record.f ?? {}) as Record<string, unknown>;
+    const uncoveredFunctions = Object.entries(fnMap)
+      .filter(([id]) => !(Number(fnHits[id]) > 0))
+      .map(([, fn]) => ({
+        name: typeof fn.name === "string" && fn.name ? fn.name : "(anonymous)",
+        line: startLine(fn.decl) ?? startLine(fn.loc) ?? (typeof fn.line === "number" ? fn.line : 0)
+      }))
+      .sort((left, right) => left.line - right.line);
+
+    const branchMap = (record.branchMap ?? {}) as Record<string, { type?: unknown; loc?: unknown; line?: unknown; locations?: unknown }>;
+    const branchHits = (record.b ?? {}) as Record<string, unknown>;
+    const uncoveredBranches = Object.entries(branchMap)
+      .flatMap(([id, branch]) => {
+        const counts = Array.isArray(branchHits[id]) ? (branchHits[id] as unknown[]).map(Number) : [];
+        const uncovered = counts.filter((count) => !(count > 0)).length;
+        if (counts.length === 0 || uncovered === 0) return [];
+        const line = startLine(branch.loc) ?? (typeof branch.line === "number" ? branch.line : 0);
+        return [{ line, type: typeof branch.type === "string" ? branch.type : "branch", uncovered, total: counts.length }];
+      })
+      .sort((left, right) => left.line - right.line);
+
+    result.set(
+      filePath,
+      capDetails({
+        uncoveredLines: toLineRanges(Array.from(missedLines).filter((line) => !coveredLines.has(line))),
+        uncoveredFunctions,
+        uncoveredBranches
+      })
+    );
+  }
+  return result;
+}
+
+/** Reads gap locations from an LCOV report, keyed by normalized file path. */
+export function parseLcovDetails(contents: string, options: CoverageParseOptions = {}): Map<string, CoverageFileDetails> {
+  const result = new Map<string, CoverageFileDetails>();
+  let current: {
+    path: string;
+    missed: number[];
+    functionLines: Map<string, number>;
+    functionHits: Map<string, number>;
+    branches: Map<string, { line: number; total: number; uncovered: number }>;
+  } | null = null;
+
+  const close = (): void => {
+    if (!current?.path) {
+      current = null;
+      return;
+    }
+    const { functionLines, functionHits } = current;
+    result.set(
+      current.path,
+      capDetails({
+        uncoveredLines: toLineRanges(current.missed),
+        uncoveredFunctions: Array.from(functionLines.entries())
+          .filter(([name]) => !((functionHits.get(name) ?? 0) > 0))
+          .map(([name, line]) => ({ name, line }))
+          .sort((left, right) => left.line - right.line),
+        uncoveredBranches: Array.from(current.branches.values())
+          .filter((branch) => branch.uncovered > 0)
+          .map((branch) => ({ line: branch.line, type: "branch", uncovered: branch.uncovered, total: branch.total }))
+          .sort((left, right) => left.line - right.line)
+      })
+    );
+    current = null;
+  };
+
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("SF:")) {
+      close();
+      current = {
+        path: normalizeCoverageFilePath(line.slice(3), options),
+        missed: [],
+        functionLines: new Map(),
+        functionHits: new Map(),
+        branches: new Map()
+      };
+    } else if (line === "end_of_record") {
+      close();
+    } else if (!current) {
+      continue;
+    } else if (line.startsWith("DA:")) {
+      const [lineNumber, hits] = line.slice(3).split(",").map(Number);
+      if (lineNumber && !(hits! > 0)) current.missed.push(lineNumber);
+    } else if (line.startsWith("FN:")) {
+      const [lineNumber, ...name] = line.slice(3).split(",");
+      current.functionLines.set(name.join(","), Number(lineNumber));
+    } else if (line.startsWith("FNDA:")) {
+      const [hits, ...name] = line.slice(5).split(",");
+      current.functionHits.set(name.join(","), Number(hits));
+    } else if (line.startsWith("BRDA:")) {
+      const [lineNumber, block, , hits] = line.slice(5).split(",");
+      const key = `${lineNumber}:${block}`;
+      const branch = current.branches.get(key) ?? { line: Number(lineNumber), total: 0, uncovered: 0 };
+      branch.total += 1;
+      if (!hits || hits === "-" || !(Number(hits) > 0)) branch.uncovered += 1;
+      current.branches.set(key, branch);
+    }
+  }
+  close();
+  return result;
 }
