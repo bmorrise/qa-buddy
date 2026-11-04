@@ -232,6 +232,7 @@ export type RepositoryInputValidation = z.infer<typeof repositoryInputSchema>;
 
 export const coverageFileQuerySchema = z.object({
   app: z.string().trim().min(1).max(100).optional(),
+  slice: z.string().trim().min(1).max(100).optional(),
   metric: z.enum(["lines", "statements", "functions", "branches"]).optional(),
   maxPercent: z.coerce.number().min(0).max(100).optional(),
   search: z.string().trim().min(1).max(200).optional(),
@@ -273,3 +274,38 @@ export const appGroupPatchSchema = z
     (value) => value.name !== undefined || value.appNames !== undefined,
     "Provide a new name, a new app selection, or both"
   );
+
+const workspaceDirectory = z
+  .string()
+  .trim()
+  .min(1, "Enter a workspace directory")
+  .max(200)
+  .transform((value) => value.replace(/\/+$/, ""))
+  .refine((value) => isSafeRelativePath(value), "Use a repository-relative directory such as apps/api");
+
+export const sliceConfigSchema = z.object({
+  backendDirectory: workspaceDirectory,
+  clientPackage: z
+    .string()
+    .trim()
+    .min(1, "Enter the generated client package name")
+    .max(214)
+    .regex(/^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i, "Enter a package name such as @acme/api-client"),
+  rootModule: z
+    .string()
+    .trim()
+    .max(200)
+    .default("src/app.module.ts")
+    .transform((value) => value || "src/app.module.ts")
+    .refine((value) => isSafeRelativePath(value), "Use a path relative to the backend workspace"),
+  frontendDirectories: z
+    .array(workspaceDirectory)
+    .max(50)
+    .default([])
+    .refine((values) => new Set(values).size === values.length, "Frontend directories must be unique")
+});
+
+export const sliceBuildRequestSchema = z.object({
+  ref: z.string().trim().refine(isSafeGitRef, "Enter a valid branch, tag, or commit SHA").optional(),
+  useLocalWorkingTree: z.boolean().default(false)
+});

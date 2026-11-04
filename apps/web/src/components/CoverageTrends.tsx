@@ -191,30 +191,51 @@ function TrendChart({
   );
 }
 
+/** A tab that narrows the chart to some of the series. */
+export type TrendScope = Pick<AppGroup, "id" | "name" | "appNames">;
+
 export function CoverageTrends({
   repositoryId,
   repositoryName = "Repository",
   groups,
   refreshKey,
-  goal = null
+  goal = null,
+  historyPath,
+  includeAllTab = true,
+  eyebrow = "Completed runs",
+  title = "Coverage trend",
+  scopeLabel = "Application group"
 }: {
   repositoryId: string;
   repositoryName?: string;
-  groups: AppGroup[];
+  groups: TrendScope[];
   refreshKey: string | null;
   goal?: number | null;
+  /** History endpoint; defaults to the repository's app coverage history. */
+  historyPath?: string;
+  /**
+   * Whether to offer an "All" tab. Slices overlap, so a weighted total across
+   * them would count shared files more than once; they pass false.
+   */
+  includeAllTab?: boolean;
+  eyebrow?: string;
+  title?: string;
+  scopeLabel?: string;
 }) {
   const [entries, setEntries] = useState<CoverageHistoryEntry[] | null>(null);
   const [error, setError] = useState("");
   const [metric, setMetric] = useState<CoverageTrendMetric>("branches");
-  const [groupId, setGroupId] = useState<string | null>(null);
+  const [selectedGroupId, setGroupId] = useState<string | null>(null);
+  const groupId = includeAllTab || groups.some((candidate) => candidate.id === selectedGroupId)
+    ? selectedGroupId
+    : groups[0]?.id ?? null;
   const [rangeId, setRangeId] = useState<RangeId>("all");
   const [focusedApp, setFocusedApp] = useState<string | null>(null);
   const [exportError, setExportError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
-    api<{ entries: CoverageHistoryEntry[] }>(`/api/repositories/${repositoryId}/coverage/history`)
+    api<{ entries: CoverageHistoryEntry[] }>(historyPath ?? `/api/repositories/${repositoryId}/coverage/history`)
       .then(({ entries: result }) => {
         if (cancelled) return;
         setEntries(result);
@@ -222,7 +243,7 @@ export function CoverageTrends({
       })
       .catch((caught: Error) => !cancelled && setError(caught.message));
     return () => { cancelled = true; };
-  }, [repositoryId, refreshKey]);
+  }, [repositoryId, refreshKey, historyPath]);
 
   const group = groups.find((candidate) => candidate.id === groupId) ?? null;
   const range = ranges.find((candidate) => candidate.id === rangeId)!;
@@ -249,7 +270,7 @@ export function CoverageTrends({
   return (
     <section className="panel detail-section coverage-trends">
       <div className="panel-heading">
-        <div><span className="eyebrow">Completed runs</span><h2>Coverage trend</h2></div>
+        <div><span className="eyebrow">{eyebrow}</span><h2>{title}</h2></div>
         <div className="trend-controls">
         <div className="filter-tabs" role="group" aria-label="Time range">
           {ranges.map((option) => (
@@ -275,9 +296,9 @@ export function CoverageTrends({
         </div>
       </div>
       <div className="trend-body">
-        {groups.length > 0 && (
-          <div className="trend-tabs" role="tablist" aria-label="Application group">
-            {[{ id: null, name: "All" }, ...groups].map((tab) => (
+        {groups.length > (includeAllTab ? 0 : 1) && (
+          <div className="trend-tabs" role="tablist" aria-label={scopeLabel}>
+            {[...(includeAllTab ? [{ id: null, name: "All" }] : []), ...groups].map((tab) => (
               <button type="button" role="tab" key={tab.id ?? "all"} aria-selected={groupId === tab.id} className={groupId === tab.id ? "selected" : ""} onClick={() => setGroupId(tab.id)}>
                 {tab.name}
               </button>

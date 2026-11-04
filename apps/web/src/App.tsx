@@ -6,6 +6,8 @@ import { RepositoryFormPage } from "./pages/RepositoryFormPage";
 import { RepositoryListPage } from "./pages/RepositoryListPage";
 import { RunDetailPage } from "./pages/RunDetailPage";
 import { RunHistoryPage } from "./pages/RunHistoryPage";
+import { SliceDetailPage } from "./pages/SliceDetailPage";
+import { SlicesPage } from "./pages/SlicesPage";
 
 export function App() {
   return (
@@ -19,6 +21,8 @@ export function App() {
           <Route path="/repositories/:repositoryId" element={<RepositoryDetailPage />} />
           <Route path="/repositories/:repositoryId/edit" element={<RepositoryFormPage />} />
           <Route path="/repositories/:repositoryId/coverage" element={<CoverageGapsPage />} />
+          <Route path="/repositories/:repositoryId/slices" element={<SlicesPage />} />
+          <Route path="/repositories/:repositoryId/slices/:sliceName" element={<SliceDetailPage />} />
           <Route path="/runs/:runId" element={<RunDetailPage />} />
           <Route path="*" element={<div className="page"><div className="empty-state panel"><h1>Page not found</h1><LinkBack /></div></div>} />
         </Routes>

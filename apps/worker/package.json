@@ -14,6 +14,7 @@
     "@qa-buddy/shared": "workspace:*",
     "dockerode": "^4.0.4",
     "fast-glob": "^3.3.3",
+    "typescript": "^5.7.2",
     "yaml": "^2.7.0"
   }
 }

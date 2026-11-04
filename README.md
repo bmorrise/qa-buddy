@@ -195,12 +195,62 @@ Istanbul summary reports provide lines, statements, functions, and branches per 
 
 Coverage percentage identifies lines that never executed, not behaviour that was never considered. A file at 100% line coverage with weak assertions still looks complete here. Treat zero-coverage files and low branch coverage as leads to investigate rather than a finished verdict.
 
+When a repository has slices, a **Slice** filter narrows the list to one slice's backend files. Slice pages link here with the filter already applied.
+
+## Slices: backend coverage by app
+
+A monorepo backend usually serves several frontends, so its overall coverage cannot tell you how well-tested any one app's backend is. A **slice** is the share of the backend that one frontend depends on, and QA Buddy measures and trends each one. Open **Slices** from the repository page.
+
+Ownership is derived from the code, never maintained by hand:
+
+1. **Frontend trace.** Starting from the app's entry point (the module script in `index.html`, otherwise `src/main` or `src/index`), QA Buddy follows runtime imports, including lazy `import()` routes, tsconfig path aliases, the Vite `@/` alias, and pnpm workspace libraries the app imports. It collects every function the app imports from the generated API client. Type-only imports, tests, stories, mocks, and Cypress files are ignored, and code the entry point no longer reaches drops out automatically.
+2. **Endpoint match.** It parses the backend's NestJS controllers and reproduces the operation ids the OpenAPI document publishes: the method name or an explicit `@ApiOperation({ operationId })`, with path or verb suffixes for duplicates, in the scanner's module registration order from the root module. Each client export (`useGetInspection`, `getGetInspectionQueryKey`, `getInspection`, and so on) then maps to exactly one endpoint.
+3. **Backend closure.** From each matched controller it follows runtime imports inside the backend workspace. The result is the slice's file list.
+
+Slices overlap by design. Shared modules such as auth, data entities, and common utilities belong to every slice that reaches them, because a change there can break any of those apps. For the same reason the slice trend has no "All" tab: a total across slices would count shared files more than once.
+
+Nothing is installed or built. The analysis reads source from a fresh checkout, so a rebuild takes seconds plus clone time, and the generated client and OpenAPI files do not need to exist.
+
+### Set up slices for a repository
+
+Slices currently support a **NestJS backend** called through an **orval-generated react-query client** that the frontends import as a pnpm workspace package. On the Slices page, open **Slice setup** and fill in the recipe:
+
+| Field | Example | Notes |
+|---|---|---|
+| Backend workspace | `apps/idp-api-service` | The NestJS app whose coverage the slices measure. It must also be a tested app in QA Buddy so its per-file coverage exists. |
+| Generated client package | `@idplans-platform/api-client` | The `package.json` name the frontends import endpoint calls from. |
+| Root module | `src/app.module.ts` | Relative to the backend workspace. Used to reproduce operation ids exactly. |
+| Frontends | `apps/idinspect, apps/idcloud` | Optional. Leave blank to slice every `apps/*` workspace whose `package.json` depends on the client package. Each slice is named after its directory. |
+
+Then select **Bake slices**. The build runs on the worker between test runs, checks out the repository's default ref (or the local working tree when that box is ticked), and stores one slice per frontend. A frontend that cannot be traced, for example one with no entry point, is skipped with the reason shown next to the build status, and the rest are still stored. A failed build keeps the previous slices.
+
+The recipe and slices live in QA Buddy's SQLite database, not in the repository being measured, so nothing QA Buddy-specific is committed there. On a new machine or a fresh data volume, re-enter the recipe and bake again. The same recipe can also be saved through the API:
+
+```bash
+curl -X PUT http://localhost:3003/api/repositories/<repository-id>/slices/config \
+  -H 'content-type: application/json' \
+  -d '{"backendDirectory":"apps/idp-api-service","clientPackage":"@idplans-platform/api-client","frontendDirectories":["apps/idinspect"]}'
+curl -X POST http://localhost:3003/api/repositories/<repository-id>/slices/builds -H 'content-type: application/json' -d '{}'
+```
+
+### When to rebake
+
+Coverage updates on its own: slice percentages are always calculated from the latest backend coverage snapshot, and every run that tests the backend adds a point to each slice's trend. Rebaking is only needed when **which files belong to a slice** may have changed, such as a frontend calling new endpoints, a new backend module, or a refactor that moves code. Rebaking every week or two, or after a large feature lands, is plenty. Each new bake also seeds a trend point from the current snapshot, so a fresh slice has a starting value immediately.
+
+### Reading a slice
+
+- **Measured** counts slice files that appear in the latest coverage report. Files with no executable code, such as type-only modules and email templates the backend does not collect coverage for, are not reported and do not affect the percentages.
+- Precision is per file. If a frontend calls one endpoint on a controller, the whole controller file and everything it imports count toward that slice.
+- A slice detail page lists the weakest files first and every endpoint the frontend calls, with the client hooks it calls them through. Use it to point test work where the app is most exposed.
+
+Not yet supported: hand-written `fetch`/`axios` calls that bypass the generated client, non-NestJS backends such as Express, and Ember Data adapters. See [docs/ideas.md](docs/ideas.md) for planned extensions.
+
 ## Architecture and security
 
 Compose runs two services from one image:
 
 - `server` owns the Fastify API, React dashboard, SQLite configuration, history, logs, and port `3003`.
-- `worker` claims one queued run at a time, clones the requested ref, starts a disposable runner container, streams its output, parses coverage, and cleans up.
+- `worker` claims one queued run at a time, clones the requested ref, starts a disposable runner container, streams its output, parses coverage, and cleans up. When no run is queued it picks up slice builds, which only read source in the worker itself and never start a runner container.
 
 The worker also bind-mounts `QA_BUDDY_LOCAL_SOURCE_ROOT` read-only at `/local-source` when that variable is set. Runner containers never receive that mount; the worker copies the archived checkout into the disposable workspace volume instead.
 
