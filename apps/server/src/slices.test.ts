@@ -151,7 +151,8 @@ describe("slice API", () => {
 
   it("exports matching coverage files as CSV or JSON, unpaged", async () => {
     database.replaceSlices(repositoryId, "build-1", "abc123", [
-      { name: "inspect", frontendDirectory: "apps/inspect", endpoints: [], backends: [{ directory: "apps/api", endpointCount: 0, files: ["apps/api/src/a,b.ts"] }] }
+      { name: "inspect", frontendDirectory: "apps/inspect", endpoints: [], backends: [{ directory: "apps/api", endpointCount: 0, files: ["apps/api/src/a,b.ts"] }] },
+      { name: "scout", frontendDirectory: "apps/scout", endpoints: [], backends: [{ directory: "apps/api", endpointCount: 0, files: ["apps/api/src/a,b.ts", "apps/api/src/c;d.ts"] }] }
     ]);
     const metric = (covered: number, total: number) => ({ covered, total, percent: Math.round((covered / total) * 1000) / 10 });
     const files = Array.from({ length: 1_205 }, (_, index) => ({
@@ -162,6 +163,7 @@ describe("slice API", () => {
       branches: metric(0, 4)
     }));
     files.push({ path: "apps/api/src/a,b.ts", lines: metric(1, 4), statements: null, functions: metric(0, 1), branches: metric(1, 2) });
+    files.push({ path: "apps/api/src/c;d.ts", lines: metric(3, 4), statements: null, functions: metric(1, 1), branches: metric(2, 2) });
     database.replaceCoverageSnapshot(repositoryId, "@acme/api", {
       runId: "run-1",
       resolvedSha: "def456",
@@ -177,8 +179,15 @@ describe("slice API", () => {
     expect(csv.headers["content-disposition"]).toMatch(/attachment; filename="platform-inspect-coverage-files-\d{4}-\d{2}-\d{2}\.csv"/);
     expect(csv.body.split("\r\n")).toEqual([
       "file,app,slices,lines_percent,lines_covered,lines_total,statements_percent,statements_covered,statements_total,functions_percent,functions_covered,functions_total,branches_percent,branches_covered,branches_total",
-      '"apps/api/src/a,b.ts",@acme/api,inspect,25,1,4,,,,0,0,1,50,1,2',
+      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2',
       ""
+    ]);
+
+    // A file in several slices keeps them in one quoted cell, whatever separator the spreadsheet assumes.
+    const shared = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?slice=scout` });
+    expect(shared.body.split("\r\n").slice(1, 3)).toEqual([
+      '"apps/api/src/a,b.ts",@acme/api,"inspect, scout",25,1,4,,,,0,0,1,50,1,2',
+      '"apps/api/src/c;d.ts",@acme/api,scout,75,3,4,,,,100,1,1,100,2,2'
     ]);
 
     const json = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=json&metric=lines&maxPercent=0` });
@@ -188,7 +197,7 @@ describe("slice API", () => {
     expect(body.files[0]).toMatchObject({ path: "apps/api/src/file-0000.ts", slices: [] });
 
     const all = await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=json` });
-    expect(all.json().total).toBe(1_206);
+    expect(all.json().total).toBe(1_207);
     expect((await app.inject({ method: "GET", url: `/api/repositories/${repositoryId}/coverage/files/export?format=xml` })).statusCode).toBe(400);
   });
 });

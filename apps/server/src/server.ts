@@ -43,7 +43,8 @@ function isUniqueConstraint(error: unknown): boolean {
 function csvCell(value: string | number | null): string {
   if (value === null) return "";
   const text = String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  // Semicolons and tabs are quoted too: some spreadsheet apps split on them.
+  return /[",;\t\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
 /** One row per file with each metric's percent, covered, and total, ready for spreadsheets. */
@@ -57,7 +58,7 @@ export function coverageFilesCsv(files: CoverageExportRow[]): string {
   const rows = files.map((file) => [
     file.path,
     file.appName,
-    file.slices.join("; "),
+    file.slices.join(", "),
     ...coverageMetricNames.flatMap((metric) => {
       const value = file[metric];
       return value ? [value.percent, value.covered, value.total] : [null, null, null];
