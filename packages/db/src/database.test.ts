@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RepositoryInput } from "@qa-buddy/shared";
 import { QaBuddyDatabase } from "./database.js";
 
@@ -10,6 +10,7 @@ const input: RepositoryInput = {
   githubUrl: "https://github.com/example/platform.git",
   defaultRef: "main",
   additionalWorkspaces: [],
+  excludedWorkspaces: [],
   runnerImage: "node:22-bookworm",
   setupCommand: "npm ci",
   buildCommand: "npm run build",
@@ -175,6 +176,40 @@ describe("QaBuddyDatabase", () => {
     expect(database.markActiveRunsInterrupted()).toEqual([active.id]);
     expect(database.getRun(active.id)?.status).toBe("interrupted");
     expect(database.getRun(queued.id)?.status).toBe("queued");
+  });
+
+  it("reports each app's most recent passing durations, newest first", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const repository = database.createRepository(input);
+      let clock = Date.parse("2026-10-01T00:00:00.000Z");
+      const runApps = (durations: Record<string, { minutes: number; status: "passed" | "failed" }>) => {
+        const run = database.createRun(repository.id);
+        database.claimNextRun();
+        for (const app of run.appRuns) {
+          const outcome = durations[app.name];
+          if (!outcome) continue;
+          vi.setSystemTime(clock);
+          database.startAppRun(app.id);
+          clock += outcome.minutes * 60_000;
+          vi.setSystemTime(clock);
+          database.finishAppRun(app.id, { status: outcome.status, exitCode: outcome.status === "passed" ? 0 : 1 });
+        }
+        database.updateRun(run.id, { status: "passed", finished: true });
+      };
+
+      runApps({ Web: { minutes: 3, status: "passed" }, API: { minutes: 10, status: "passed" } });
+      runApps({ Web: { minutes: 4, status: "passed" }, API: { minutes: 99, status: "failed" } });
+      runApps({ Web: { minutes: 5, status: "passed" } });
+
+      const durations = database.recentPassingAppDurations(repository.id, 2);
+      expect(durations.get("Web")).toEqual([300_000, 240_000]);
+      // Failed runs say nothing about how long a healthy run takes.
+      expect(durations.get("API")).toEqual([600_000]);
+      expect(database.recentPassingAppDurations("missing", 2).size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the latest completed run separate from in-progress and partial runs", () => {
@@ -504,6 +539,22 @@ describe("QaBuddyDatabase", () => {
     expect(repository.coverageGoal).toBeNull();
     expect(database.updateRepository(repository.id, { ...input, coverageGoal: 70 })?.coverageGoal).toBe(70);
     expect(database.updateRepository(repository.id, { ...input, coverageGoal: null })?.coverageGoal).toBeNull();
+  });
+
+  it("stores excluded workspaces and hides them from selectable apps before the next run", () => {
+    const repository = database.createRepository({ ...input, autoDetect: true, apps: [] });
+    expect(repository.excludedWorkspaces).toEqual([]);
+    const run = database.createRun(repository.id);
+    database.setDetectedApps(run.id, input.apps);
+
+    const updated = database.updateRepository(repository.id, {
+      ...input,
+      autoDetect: true,
+      apps: [],
+      excludedWorkspaces: ["apps/api"]
+    });
+    expect(updated?.excludedWorkspaces).toEqual(["apps/api"]);
+    expect(database.getRepositoryDetail(repository.id)?.selectableApps.map((app) => app.name)).toEqual(["Web"]);
   });
 
   it("appends new groups and reorders them only with the complete list", () => {

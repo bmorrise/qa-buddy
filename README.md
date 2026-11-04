@@ -42,7 +42,7 @@ Repository configuration includes:
 - An optional setup command that runs once at the repository root.
 - An optional build-command override that runs once after setup and before any selected app tests.
 - A per-app test-worker limit, defaulting to `2`, for auto-detected Jest and Vitest commands. Parallel Jest workers are recycled after 1 GiB so long suites cannot grow a worker until Node exhausts its heap; scripts already using `--runInBand` keep their intentional serial execution.
-- A timeout from 1 to 120 minutes.
+- An overall run timeout from 1 to 120 minutes. This is a safety cap; individual apps are held to their own limits (see [Time limits](#time-limits)).
 - Optional environment variable names to pass from the worker to the runner.
 - Automatic pnpm/Turborepo app detection, or one or more manually configured apps.
 
@@ -68,6 +68,12 @@ Inclusion is explicit rather than automatic so that adding a library to the repo
 
 - A directory that is not a pnpm workspace fails the run with an actionable error. Asking for something that cannot run is a configuration mistake, and failing quietly would leave you wondering why it never appeared.
 - A workspace whose test script is missing, or whose suite reports no tests at all (for example a package mid-migration running `--passWithNoTests`), is skipped without failing the run. Its applications are marked skipped and no coverage snapshot is written, so an empty suite never registers as 0% coverage.
+
+### Excluding workspaces
+
+List directories in **Excluded workspaces** on the repository form, comma separated, to keep auto-detection from testing them even when they have a test script, for example `apps/user-crm-sync` before it has a real suite. Exclusions apply to `apps/*` and to the fallback used when there is no `apps/` directory. A directory cannot be both additional and excluded. Newly excluded apps leave the selectable app list as soon as the configuration is saved.
+
+Unlike additional workspaces, an exclusion that matches no workspace (an app since deleted from the repository, say) does not fail the run. The run log lists what was excluded and warns about entries it could not find, so stale exclusions are visible without blocking everything else.
 
 The form suggests `corepack enable && pnpm install --frozen-lockfile` as the setup command and `pnpm build` as the build command when auto-detection is enabled. A build failure skips all app tests so tests never run against missing workspace artifacts. Adjust either command when the repository uses a different bootstrap or build entry point.
 
@@ -162,6 +168,16 @@ A run that has not been claimed by the worker yet stops instantly. A run already
 While a run is active the repository page refreshes every two seconds; the run detail page streams updates continuously.
 
 Stopped runs never update a coverage snapshot, since their apps did not finish.
+
+## Time limits
+
+Each app's test command gets its own time limit, so one slow or stuck app fails on its own instead of using up the run's time and leaving every later app skipped.
+
+- **Per-app limit.** Three times the app's slowest passing duration across its last five passing runs in this repository, with a minimum of 10 minutes. An app with no passing history gets 30 minutes. The run log shows each app's limit and how it was derived, for example `Testing @idplans/idp-api-service (time limit 48 minutes: 3x its slowest recent pass of 16 minutes)`.
+- **No-output timeout.** Any setup, build, or test command that prints nothing for 10 minutes is treated as hung. This catches, for example, a Jest process that finishes its tests but never exits.
+- **Overall timeout.** The repository's run timeout still applies as a safety cap across the whole run.
+
+When an app exceeds its limit or goes silent, QA Buddy kills that command and every worker it started, records the app as failed with the reason, and continues with the next app in the same runner. The run then finishes as `failed`, noting how many apps timed out. A hung setup or build cannot be skipped past, so it ends the run as `timed_out`, as does reaching the overall timeout.
 
 ## Coverage gaps
 

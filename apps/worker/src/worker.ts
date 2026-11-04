@@ -13,7 +13,7 @@ import {
   type TestResults
 } from "@qa-buddy/shared";
 import { clearAppReports, detectPnpmWorkspaceApps, discoverCoverageReport } from "./detection.js";
-import { cleanupOrphanRunners, DockerRunner, RunnerTimeoutError } from "./docker-runner.js";
+import { cleanupOrphanRunners, CommandTimeoutError, DockerRunner, RunnerTimeoutError } from "./docker-runner.js";
 import {
   archiveLocalWorkingTree,
   cloneRepository,
@@ -23,6 +23,13 @@ import {
 import { RunLogger } from "./logger.js";
 import { ProcessError } from "./process.js";
 import { readTestResults } from "./test-results.js";
+import {
+  APP_TIME_LIMIT_HISTORY,
+  appTimeLimit,
+  formatMinutes,
+  IDLE_TIMEOUT_MS,
+  type AppTimeLimit
+} from "./timeouts.js";
 
 class SetupError extends Error {}
 class BuildError extends Error {}
@@ -47,6 +54,10 @@ export interface WorkerOptions {
   pollIntervalMs?: number;
   /** How often an in-flight run checks whether a stop has been requested. */
   cancellationPollMs?: number;
+  /** Overrides the hung-command timeout; tests use a short one. */
+  idleTimeoutMs?: number;
+  /** Overrides how each app's time limit is derived from its history. */
+  appTimeLimit?: (recentPassingDurationsMs: number[]) => AppTimeLimit;
 }
 
 export type CoverageSnapshotSkipReason = "no-coverage" | "local-working-tree" | "no-files";
@@ -243,6 +254,7 @@ export class QaBuddyWorker {
     const deadline = Date.now() + run.configurationSnapshot.timeoutMinutes * 60_000;
     let repositoryDirectory = "";
     let appFailures = 0;
+    let appTimeouts = 0;
     let appRuns = run.appRuns;
     let cancelled = false;
 
@@ -310,12 +322,21 @@ export class QaBuddyWorker {
         const detection = await detectPnpmWorkspaceApps(
           repositoryDirectory,
           run.configurationSnapshot.testWorkerLimit,
-          run.configurationSnapshot.additionalWorkspaces ?? []
+          run.configurationSnapshot.additionalWorkspaces ?? [],
+          run.configurationSnapshot.excludedWorkspaces ?? []
         );
         logger.line(
           `Detected ${detection.apps.length} testable app${detection.apps.length === 1 ? "" : "s"} across ${detection.workspaceCount} pnpm workspace${detection.workspaceCount === 1 ? "" : "s"}${detection.hasTurbo ? " with turbo.json" : ""}`
         );
         logger.line(`Auto-detected test worker limit: ${run.configurationSnapshot.testWorkerLimit}`);
+        if (detection.excluded.length) {
+          logger.line(`Excluded workspaces: ${detection.excluded.join(", ")}`);
+        }
+        if (detection.unmatchedExclusions.length) {
+          logger.line(
+            `Warning: excluded workspaces not found in this repository, ignoring: ${detection.unmatchedExclusions.join(", ")}`
+          );
+        }
         for (const app of detection.apps) {
           logger.line(`Detected app ${app.name} at ${app.workingDirectory} using ${app.testCommand}`);
         }
@@ -339,11 +360,10 @@ export class QaBuddyWorker {
       if (run.configurationSnapshot.setupCommand) {
         this.options.database.updateRun(run.id, { status: "setup" });
         logger.line("Running repository setup");
-        const setup = await this.activeRunner.exec(
-          run.configurationSnapshot.setupCommand,
-          workspaceContainerPath,
-          this.remaining(deadline)
-        );
+        const setup = await this.activeRunner.exec(run.configurationSnapshot.setupCommand, workspaceContainerPath, {
+          runRemainingMs: this.remaining(deadline),
+          idleMs: this.options.idleTimeoutMs ?? IDLE_TIMEOUT_MS
+        });
         ensureRunning();
         if (setup.exitCode !== 0) {
           throw new SetupError(`Setup command exited with code ${setup.exitCode}`);
@@ -353,11 +373,10 @@ export class QaBuddyWorker {
       if (run.configurationSnapshot.buildCommand) {
         this.options.database.updateRun(run.id, { status: "building" });
         logger.line("Building repository before tests");
-        const build = await this.activeRunner.exec(
-          run.configurationSnapshot.buildCommand,
-          workspaceContainerPath,
-          this.remaining(deadline)
-        );
+        const build = await this.activeRunner.exec(run.configurationSnapshot.buildCommand, workspaceContainerPath, {
+          runRemainingMs: this.remaining(deadline),
+          idleMs: this.options.idleTimeoutMs ?? IDLE_TIMEOUT_MS
+        });
         ensureRunning();
         if (build.exitCode !== 0) {
           throw new BuildError(`Build command exited with code ${build.exitCode}`);
@@ -365,10 +384,15 @@ export class QaBuddyWorker {
       }
 
       this.options.database.updateRun(run.id, { status: "testing" });
+      const passingDurations = this.options.database.recentPassingAppDurations(
+        run.repositoryId,
+        APP_TIME_LIMIT_HISTORY
+      );
       for (const appRun of appRuns) {
         ensureRunning();
         this.options.database.startAppRun(appRun.id);
-        logger.line(`Testing ${appRun.name}`);
+        const timeLimit = (this.options.appTimeLimit ?? appTimeLimit)(passingDurations.get(appRun.name) ?? []);
+        logger.line(`Testing ${appRun.name} (time limit ${formatMinutes(timeLimit.limitMs)}: ${timeLimit.basis})`);
         let exitCode = 1;
         let coverage: CoverageSummary | null = null;
         let coverageFormat: CoverageFormat | undefined;
@@ -382,7 +406,11 @@ export class QaBuddyWorker {
           const result = await this.activeRunner.exec(
             appRun.testCommand,
             path.posix.join(workspaceContainerPath, appRun.workingDirectory),
-            this.remaining(deadline)
+            {
+              runRemainingMs: this.remaining(deadline),
+              idleMs: this.options.idleTimeoutMs ?? IDLE_TIMEOUT_MS,
+              commandMs: timeLimit.limitMs
+            }
           );
           ensureRunning();
           exitCode = result.exitCode;
@@ -416,9 +444,16 @@ export class QaBuddyWorker {
             logger.line(`${appRun.name} coverage error: ${coverageError}`);
           }
         } catch (error) {
+          // A stop request kills the runner, which can surface here as a timeout.
+          ensureRunning();
           if (error instanceof RunnerTimeoutError || error instanceof RunCancelledError) throw error;
           coverageError = error instanceof Error ? error.message : "Test command failed to execute";
-          logger.line(`${appRun.name} command error: ${coverageError}`);
+          if (error instanceof CommandTimeoutError) {
+            appTimeouts += 1;
+            logger.line(`${appRun.name} timed out: ${coverageError}; continuing with the next app`);
+          } else {
+            logger.line(`${appRun.name} command error: ${coverageError}`);
+          }
         }
 
         // A suite that ran cleanly with nothing to run (for example a package
@@ -461,7 +496,7 @@ export class QaBuddyWorker {
       if (appFailures > 0) {
         this.options.database.updateRun(run.id, {
           status: "failed",
-          error: `${appFailures} app${appFailures === 1 ? "" : "s"} did not produce a passing test and coverage result`,
+          error: `${appFailures} app${appFailures === 1 ? "" : "s"} did not produce a passing test and coverage result${appTimeouts > 0 ? ` (${appTimeouts} timed out)` : ""}`,
           finished: true
         });
       } else {
@@ -479,7 +514,9 @@ export class QaBuddyWorker {
         });
       } else {
         const timedOut =
-          error instanceof RunnerTimeoutError || (error instanceof ProcessError && error.exitCode === null);
+          error instanceof RunnerTimeoutError ||
+          error instanceof CommandTimeoutError ||
+          (error instanceof ProcessError && error.exitCode === null);
         const message = error instanceof Error ? error.message : "Run failed unexpectedly";
         logger.line(`${timedOut ? "Timeout" : "Run failure"}: ${message}`);
         this.options.database.skipPendingApps(run.id, message);

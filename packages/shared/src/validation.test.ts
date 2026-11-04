@@ -218,3 +218,60 @@ describe("additional workspaces", () => {
     expect(result.success).toBe(false);
   });
 });
+
+describe("excluded workspaces", () => {
+  const base = {
+    name: "Platform",
+    githubUrl: "https://github.com/example/repository",
+    defaultRef: "main",
+    runnerImage: "node:22-bookworm",
+    autoDetect: true,
+    apps: []
+  };
+
+  it("accepts relative workspace directories and defaults to none", () => {
+    expect(repositoryInputSchema.parse(base).excludedWorkspaces).toEqual([]);
+    expect(
+      repositoryInputSchema.parse({ ...base, excludedWorkspaces: ["apps/user-crm-sync"] }).excludedWorkspaces
+    ).toEqual(["apps/user-crm-sync"]);
+  });
+
+  it.each(["../escape", "/apps/user-crm-sync", "apps/../../escape"])("rejects %s", (workspace) => {
+    expect(repositoryInputSchema.safeParse({ ...base, excludedWorkspaces: [workspace] }).success).toBe(false);
+  });
+
+  it("rejects duplicates", () => {
+    expect(
+      repositoryInputSchema.safeParse({ ...base, excludedWorkspaces: ["apps/user-crm-sync", "apps/user-crm-sync"] })
+        .success
+    ).toBe(false);
+  });
+
+  it("rejects excluded workspaces when auto-detection is off", () => {
+    const result = repositoryInputSchema.safeParse({
+      ...base,
+      autoDetect: false,
+      apps: [
+        {
+          name: "Web",
+          workingDirectory: ".",
+          testCommand: "pnpm test",
+          coverageFormat: "istanbul-summary-json",
+          coveragePath: "coverage/coverage-summary.json"
+        }
+      ],
+      excludedWorkspaces: ["apps/user-crm-sync"]
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a workspace that is both additional and excluded", () => {
+    const result = repositoryInputSchema.safeParse({
+      ...base,
+      additionalWorkspaces: ["libs/scout-ui"],
+      excludedWorkspaces: ["libs/scout-ui"]
+    });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toContain("both additional and excluded: libs/scout-ui");
+  });
+});

@@ -82,6 +82,7 @@ function repositoryFixture(): RepositoryDetail {
     testWorkerLimit: 2,
     timeoutMinutes: 30,
     additionalWorkspaces: [],
+    excludedWorkspaces: [],
     environmentAllowlist: [],
     autoDetect: true,
     coverageGoal: null,

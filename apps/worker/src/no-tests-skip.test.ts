@@ -66,6 +66,7 @@ const repositoryInput: RepositoryInput = {
   defaultRef: "main",
   localPath: "platform",
   additionalWorkspaces: [],
+  excludedWorkspaces: [],
   runnerImage: "node:22-bookworm",
   testWorkerLimit: 2,
   timeoutMinutes: 30,

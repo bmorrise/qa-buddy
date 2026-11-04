@@ -28,6 +28,10 @@ const JEST_WORKER_IDLE_MEMORY_LIMIT = "1GB";
 
 export interface WorkspaceDetectionResult {
   apps: AppInput[];
+  /** Excluded workspace directories that matched a detected workspace. */
+  excluded: string[];
+  /** Excluded workspace directories that match no workspace in this checkout. */
+  unmatchedExclusions: string[];
   hasTurbo: boolean;
   workspaceCount: number;
 }
@@ -126,7 +130,8 @@ function configuredJestCoveragePath(manifest: PackageManifest, directory: string
 export async function detectPnpmWorkspaceApps(
   repositoryDirectory: string,
   testWorkerLimit = 2,
-  additionalWorkspaces: string[] = []
+  additionalWorkspaces: string[] = [],
+  excludedWorkspaces: string[] = []
 ): Promise<WorkspaceDetectionResult> {
   const workspacePath = path.join(repositoryDirectory, "pnpm-workspace.yaml");
   if (!existsSync(workspacePath)) {
@@ -190,9 +195,18 @@ export async function detectPnpmWorkspaceApps(
   }
   const requestedSet = new Set(requested);
 
-  const appManifests = manifests.some(({ directory }) => inAppsGroup(directory))
+  const candidateManifests = manifests.some(({ directory }) => inAppsGroup(directory))
     ? manifests.filter(({ directory }) => inAppsGroup(directory) || requestedSet.has(directory))
     : manifests;
+
+  // Exclusions are the opposite trade-off: an entry that matches nothing, such
+  // as an app since deleted from the repository, is reported but never fails
+  // the run, so a stale exclusion cannot block testing everything else.
+  const exclusions = Array.from(new Set(excludedWorkspaces.map((value) => value.replace(/\/+$/, ""))));
+  const exclusionSet = new Set(exclusions);
+  const excluded = exclusions.filter((directory) => knownDirectories.has(directory));
+  const unmatchedExclusions = exclusions.filter((directory) => !knownDirectories.has(directory));
+  const appManifests = candidateManifests.filter(({ directory }) => !exclusionSet.has(directory));
 
   const usedNames = new Set<string>();
   const apps = appManifests.flatMap(({ directory, manifest }) => {
@@ -219,13 +233,16 @@ export async function detectPnpmWorkspaceApps(
 
   if (apps.length === 0) {
     const location = appManifests.length ? "detected app workspaces" : "pnpm workspaces";
+    const exclusionNote = excluded.length ? ` (excluded: ${excluded.join(", ")})` : "";
     throw new Error(
-      `No coverage-capable test scripts were found in ${location}; add test:coverage, test:cov, coverage, or test to package.json`
+      `No coverage-capable test scripts were found in ${location}${exclusionNote}; add test:coverage, test:cov, coverage, or test to package.json`
     );
   }
 
   return {
     apps,
+    excluded,
+    unmatchedExclusions,
     hasTurbo: existsSync(path.join(repositoryDirectory, "turbo.json")),
     workspaceCount: manifests.length
   };

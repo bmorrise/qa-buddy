@@ -18,6 +18,7 @@ const initialValue: RepositoryInput = {
   defaultRef: "main",
   localPath: undefined,
   additionalWorkspaces: [],
+  excludedWorkspaces: [],
   runnerImage: "node:22-bookworm",
   setupCommand: "npm ci",
   buildCommand: undefined,
@@ -35,6 +36,7 @@ export function RepositoryFormPage() {
   const [value, setValue] = useState<RepositoryInput>(initialValue);
   const [environmentNames, setEnvironmentNames] = useState("");
   const [workspaceNames, setWorkspaceNames] = useState("");
+  const [excludedNames, setExcludedNames] = useState("");
   const [loading, setLoading] = useState(Boolean(repositoryId));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -49,6 +51,7 @@ export function RepositoryFormPage() {
           defaultRef: repository.defaultRef,
           localPath: repository.localPath,
           additionalWorkspaces: repository.additionalWorkspaces ?? [],
+          excludedWorkspaces: repository.excludedWorkspaces ?? [],
           runnerImage: repository.runnerImage,
           setupCommand: repository.setupCommand,
           buildCommand: repository.buildCommand,
@@ -61,6 +64,7 @@ export function RepositoryFormPage() {
         });
         setEnvironmentNames(repository.environmentAllowlist.join(", "));
         setWorkspaceNames((repository.additionalWorkspaces ?? []).join(", "));
+        setExcludedNames((repository.excludedWorkspaces ?? []).join(", "));
       })
       .catch((caught: Error) => setError(caught.message))
       .finally(() => setLoading(false));
@@ -86,6 +90,12 @@ export function RepositoryFormPage() {
         .filter(Boolean),
       additionalWorkspaces: value.autoDetect
         ? workspaceNames
+            .split(",")
+            .map((name) => name.trim().replace(/\/+$/, ""))
+            .filter(Boolean)
+        : [],
+      excludedWorkspaces: value.autoDetect
+        ? excludedNames
             .split(",")
             .map((name) => name.trim().replace(/\/+$/, ""))
             .filter(Boolean)
@@ -348,6 +358,20 @@ export function RepositoryFormPage() {
                   that are not applications. Each must be a pnpm workspace with a <code>package.json</code>, and a
                   directory that cannot be found fails the run. Workspaces with no test script, or whose suite
                   reports no tests, are skipped without failing the run.
+                </small>
+              </label>
+              <label className="field-span additional-workspaces">
+                <span>Excluded workspaces</span>
+                <input
+                  value={excludedNames}
+                  onChange={(event) => setExcludedNames(event.target.value)}
+                  placeholder="apps/user-crm-sync"
+                  autoComplete="off"
+                />
+                <small>
+                  Comma-separated workspace directories that are never tested, even when they have a test script, such
+                  as deprecated apps or packages with nothing to unit test. A directory that no longer exists is logged
+                  as a warning and ignored rather than failing the run.
                 </small>
               </label>
             </>
