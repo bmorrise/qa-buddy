@@ -283,27 +283,69 @@ const workspaceDirectory = z
   .transform((value) => value.replace(/\/+$/, ""))
   .refine((value) => isSafeRelativePath(value), "Use a repository-relative directory such as apps/api");
 
+const packageName = z
+  .string()
+  .trim()
+  .max(214)
+  .regex(/^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i, "Enter a package name such as @acme/api-client");
+
+const optionalRelativeFile = z
+  .string()
+  .trim()
+  .max(200)
+  .nullish()
+  .transform((value) => value || null)
+  .refine((value) => value === null || isSafeRelativePath(value), "Use a path relative to the backend workspace");
+
+export const sliceBackendSchema = z
+  .object({
+    directory: workspaceDirectory,
+    framework: z.enum(["nestjs", "express"]),
+    clientPackage: z
+      .union([packageName, z.literal("")])
+      .nullish()
+      .transform((value) => value || null),
+    rootModule: optionalRelativeFile,
+    entryFile: optionalRelativeFile,
+    baseUrlNames: z
+      .array(z.string().trim().regex(/^[A-Za-z_$][\w$]*$/, "Base URL names are identifiers such as VITE_API_HOST or apiHost"))
+      .max(20)
+      .default([])
+  })
+  .transform((backend) => ({
+    ...backend,
+    clientPackage: backend.framework === "nestjs" ? backend.clientPackage : null,
+    rootModule: backend.framework === "nestjs" ? backend.rootModule ?? "src/app.module.ts" : null,
+    entryFile: backend.framework === "express" ? backend.entryFile ?? "app.js" : null
+  }))
+  .superRefine((backend, context) => {
+    if (!backend.clientPackage && backend.baseUrlNames.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          backend.framework === "express"
+            ? `${backend.directory}: add the base URL names frontends use for this backend`
+            : `${backend.directory}: add a generated client package, base URL names, or both`
+      });
+    }
+  });
+
 export const sliceConfigSchema = z.object({
-  backendDirectory: workspaceDirectory,
-  clientPackage: z
-    .string()
-    .trim()
-    .min(1, "Enter the generated client package name")
-    .max(214)
-    .regex(/^(@[a-z0-9][\w.-]*\/)?[a-z0-9][\w.-]*$/i, "Enter a package name such as @acme/api-client"),
-  rootModule: z
-    .string()
-    .trim()
-    .max(200)
-    .default("src/app.module.ts")
-    .transform((value) => value || "src/app.module.ts")
-    .refine((value) => isSafeRelativePath(value), "Use a path relative to the backend workspace"),
+  backends: z
+    .array(sliceBackendSchema)
+    .min(1, "Add at least one backend")
+    .max(6)
+    .refine((backends) => new Set(backends.map((backend) => backend.directory)).size === backends.length, "Each backend directory can appear once"),
   frontendDirectories: z
     .array(workspaceDirectory)
     .max(50)
     .default([])
     .refine((values) => new Set(values).size === values.length, "Frontend directories must be unique")
 });
+
+export const coverageExportQuerySchema = coverageFileQuerySchema
+  .omit({ limit: true, offset: true })
+  .extend({ format: z.enum(["csv", "json"]).default("csv") });
 
 export const sliceBuildRequestSchema = z.object({
   ref: z.string().trim().refine(isSafeGitRef, "Enter a valid branch, tag, or commit SHA").optional(),

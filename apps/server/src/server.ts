@@ -7,7 +7,10 @@ import {
   appGroupInputSchema,
   appGroupOrderSchema,
   appGroupPatchSchema,
+  coverageExportQuerySchema,
   coverageFileQuerySchema,
+  coverageMetricNames,
+  type CoverageExportRow,
   repositoryInputSchema,
   runRequestSchema,
   sliceBuildRequestSchema,
@@ -35,6 +38,36 @@ function isUniqueConstraint(error: unknown): boolean {
     "code" in error &&
     String((error as Error & { code: unknown }).code).startsWith("SQLITE_CONSTRAINT_UNIQUE")
   );
+}
+
+function csvCell(value: string | number | null): string {
+  if (value === null) return "";
+  const text = String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+/** One row per file with each metric's percent, covered, and total, ready for spreadsheets. */
+export function coverageFilesCsv(files: CoverageExportRow[]): string {
+  const header = [
+    "file",
+    "app",
+    "slices",
+    ...coverageMetricNames.flatMap((metric) => [`${metric}_percent`, `${metric}_covered`, `${metric}_total`])
+  ];
+  const rows = files.map((file) => [
+    file.path,
+    file.appName,
+    file.slices.join("; "),
+    ...coverageMetricNames.flatMap((metric) => {
+      const value = file[metric];
+      return value ? [value.percent, value.covered, value.total] : [null, null, null];
+    })
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+}
+
+function fileSlug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "export";
 }
 
 function logPath(dataDirectory: string, runId: string): string {
@@ -249,6 +282,34 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
         return reply.code(404).send({ error: "Repository not found" });
       }
       return { entries: database.listCoverageHistory(request.params.repositoryId) };
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string }; Querystring: Record<string, string | undefined> }>(
+    "/api/repositories/:repositoryId/coverage/files/export",
+    async (request, reply) => {
+      const repository = database.getRepository(request.params.repositoryId);
+      if (!repository) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const parsed = coverageExportQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: issueMessage(parsed.error) });
+      }
+      const { format, app: appName, slice, metric, maxPercent, search } = parsed.data;
+      const filters = { appName, sliceName: slice, metric, maxPercent, search };
+      const files = database.exportCoverageFiles(repository.id, filters);
+      const generatedAt = new Date().toISOString();
+      const name = [fileSlug(repository.name), slice ? fileSlug(slice) : appName ? fileSlug(appName) : "all", "coverage-files", generatedAt.slice(0, 10)].join("-");
+      if (format === "json") {
+        return reply
+          .header("content-disposition", `attachment; filename="${name}.json"`)
+          .send({ repository: { id: repository.id, name: repository.name }, generatedAt, filters, total: files.length, files });
+      }
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header("content-disposition", `attachment; filename="${name}.csv"`)
+        .send(coverageFilesCsv(files));
     }
   );
 

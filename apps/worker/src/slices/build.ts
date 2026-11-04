@@ -77,15 +77,24 @@ export async function executeSliceBuild(build: SliceBuild, options: SliceBuildOp
     const targets = config.frontendDirectories.length
       ? config.frontendDirectories.map((directory) => ({ name: path.posix.basename(directory), frontendDirectory: directory }))
       : null;
-    const result = await analyzeSlices(source.repositoryDirectory, targets, {
-      backendDirectory: config.backendDirectory,
-      clientPackage: config.clientPackage,
-      rootModule: config.rootModule
-    });
+    const result = await analyzeSlices(
+      source.repositoryDirectory,
+      targets,
+      config.backends.map((backend) => ({
+        directory: backend.directory,
+        framework: backend.framework,
+        clientPackage: backend.clientPackage ?? undefined,
+        rootModule: backend.rootModule ?? undefined,
+        entryFile: backend.entryFile ?? undefined,
+        baseUrlNames: backend.baseUrlNames
+      }))
+    );
     for (const slice of result.slices) {
-      logger.line(
-        `Sliced ${slice.frontendDirectory}: ${slice.endpoints.length} endpoints, ${slice.backendFiles.length} backend files`
-      );
+      const parts = slice.backends.map((backend) => `${backend.directory} ${backend.endpointCount} endpoints / ${backend.files.length} files`);
+      logger.line(`Sliced ${slice.frontendDirectory}: ${parts.join("; ")}`);
+      for (const call of slice.unmatchedCalls) {
+        logger.line(`  Unmatched ${call.method?.toUpperCase() ?? "request"} ${call.path} to ${call.backendDirectory} at ${call.site}`);
+      }
     }
     for (const skipped of result.skipped) {
       logger.line(`Skipped ${skipped.frontendDirectory}: ${skipped.reason}`);
@@ -94,7 +103,7 @@ export async function executeSliceBuild(build: SliceBuild, options: SliceBuildOp
       throw new Error(
         targets
           ? "None of the configured frontends could be sliced"
-          : `No apps/* workspace depends on ${config.clientPackage}; list the frontends to slice explicitly`
+          : "No apps/* workspace depends on a configured client package; list the frontends to slice explicitly"
       );
     }
 
@@ -105,9 +114,9 @@ export async function executeSliceBuild(build: SliceBuild, options: SliceBuildOp
       result.slices.map((slice) => ({
         name: slice.name,
         frontendDirectory: slice.frontendDirectory,
-        backendDirectory: slice.backendDirectory,
         endpoints: slice.endpoints.map(({ ambiguous: _ambiguous, ...endpoint }) => endpoint),
-        files: slice.backendFiles
+        backends: slice.backends,
+        unmatchedCalls: slice.unmatchedCalls
       }))
     );
     database.finishSliceBuild(build.id, { status: "passed", sliceCount: result.slices.length, skipped: result.skipped });

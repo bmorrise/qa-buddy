@@ -221,18 +221,16 @@ export class QaBuddyWorker {
   }
 
   /**
-   * Adds this run's point to every slice measured against the app that just
-   * finished. Unlike the snapshot, local working tree runs are recorded and
-   * flagged, matching app coverage history.
+   * Adds this run's point to every slice that reaches a backend the run tested.
+   * Unlike the snapshot, local working tree runs are recorded and flagged,
+   * matching app coverage history.
    */
   private recordSliceHistory(
     run: RunDetail,
-    appRun: AppRun,
     logger: RunLogger,
     source: { resolvedSha: string; dirty: boolean },
-    coverageFiles: CoverageFileEntry[]
+    filesByDirectory: Map<string, CoverageFileEntry[]>
   ): void {
-    if (coverageFiles.length === 0) return;
     try {
       const written = this.options.database.recordSliceHistory({
         repositoryId: run.repositoryId,
@@ -241,10 +239,9 @@ export class QaBuddyWorker {
         resolvedSha: source.resolvedSha,
         useLocalWorkingTree: run.useLocalWorkingTree,
         dirty: source.dirty,
-        workingDirectory: appRun.workingDirectory,
-        files: coverageFiles
+        filesByDirectory
       });
-      if (written) logger.line(`Recorded ${appRun.name} coverage for ${written} slice${written === 1 ? "" : "s"}`);
+      if (written) logger.line(`Recorded coverage for ${written} slice${written === 1 ? "" : "s"}`);
     } catch (error) {
       logger.line(`Unable to record slice coverage: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -296,6 +293,10 @@ export class QaBuddyWorker {
     let appTimeouts = 0;
     let appRuns = run.appRuns;
     let cancelled = false;
+    // Per-file coverage by app directory, so slices spanning several backends
+    // get one point per run built from all of them.
+    const sliceCoverage = new Map<string, CoverageFileEntry[]>();
+    let sliceSource: { resolvedSha: string; dirty: boolean } | null = null;
 
     // Polled rather than pushed: the server and worker are separate processes
     // that share only SQLite.
@@ -347,6 +348,7 @@ export class QaBuddyWorker {
           };
       ensureRunning();
       repositoryDirectory = source.repositoryDirectory;
+      sliceSource = source;
       this.options.database.updateRun(run.id, {
         resolvedSha: source.resolvedSha,
         dirty: source.dirty
@@ -520,7 +522,7 @@ export class QaBuddyWorker {
           coverageFormat,
           coveragePath
         });
-        this.recordSliceHistory(run, appRun, logger, source, coverageFiles);
+        if (coverageFiles.length) sliceCoverage.set(appRun.workingDirectory, coverageFiles);
         this.options.database.finishAppRun(appRun.id, {
           status: passed ? "passed" : "failed",
           exitCode,
@@ -568,6 +570,7 @@ export class QaBuddyWorker {
       }
     } finally {
       clearInterval(cancellationPoll);
+      if (sliceSource && sliceCoverage.size) this.recordSliceHistory(run, logger, sliceSource, sliceCoverage);
       if (this.activeRunner) {
         try {
           await this.activeRunner.remove();

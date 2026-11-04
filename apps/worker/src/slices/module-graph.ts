@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import ts from "typescript";
 import type { WorkspacePackage } from "./workspaces.js";
@@ -13,6 +13,30 @@ export function isApplicationSource(repositoryRelativePath: string): boolean {
   return !NON_SOURCE_PATTERN.test(repositoryRelativePath);
 }
 
+/**
+ * Whether a file depends on its sibling modules by loading them at runtime, as
+ * Sequelize's `models/index.js` does with `require(path.join(__dirname, file))`.
+ * Express route indexes that mount siblings with `router.use(require(...))` do
+ * not count: mounting is routing, handled by the Express route index, and
+ * following it would pull every route into every slice.
+ */
+export function loadsSiblingsDynamically(text: string): boolean {
+  return /readdirSync\(\s*__dirname\s*\)/.test(text) && /require\(\s*(?!['"])/.test(text) && !/\.use\(\s*require\(/.test(text);
+}
+
+/** Code files next to `file`, excluding the file itself and tests. */
+export function siblingModules(file: string): string[] {
+  const directory = path.dirname(file);
+  try {
+    return readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.(c|m)?[jt]s$/.test(entry.name) && !entry.name.endsWith(".d.ts"))
+      .map((entry) => path.join(directory, entry.name))
+      .filter((candidate) => candidate !== file && !/\.(test|spec)\.[cm]?[jt]s$/.test(candidate));
+  } catch {
+    return [];
+  }
+}
+
 export interface ParsedModule {
   /** Runtime module specifiers: static imports, re-exports, import() and require(). */
   specifiers: string[];
@@ -21,6 +45,8 @@ export interface ParsedModule {
    * re-export whose members could not be narrowed down.
    */
   importedNames: Map<string, Set<string>>;
+  /** True when the module requires its sibling files at runtime; see {@link loadsSiblingsDynamically}. */
+  loadsSiblings: boolean;
 }
 
 function stringArgument(node: ts.CallExpression): string | null {
@@ -103,7 +129,7 @@ export function parseModule(fileName: string, text: string): ParsedModule {
   };
   visit(source);
 
-  return { specifiers: Array.from(new Set(specifiers)), importedNames };
+  return { specifiers: Array.from(new Set(specifiers)), importedNames, loadsSiblings: loadsSiblingsDynamically(text) };
 }
 
 interface PathAliases {
@@ -261,7 +287,7 @@ export class ModuleResolver {
     try {
       parsed = parseModule(absolutePath, readFileSync(absolutePath, "utf8"));
     } catch {
-      parsed = { specifiers: [], importedNames: new Map() };
+      parsed = { specifiers: [], importedNames: new Map(), loadsSiblings: false };
     }
     this.parseCache.set(absolutePath, parsed);
     return parsed;

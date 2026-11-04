@@ -1,8 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { isApplicationSource, ModuleResolver, resolveSourceFile } from "./module-graph.js";
+import { findExpressEndpoints } from "./express-routes.js";
+import { isApplicationSource, ModuleResolver, resolveSourceFile, siblingModules } from "./module-graph.js";
 import { buildClientNameIndex, candidateOperationIds, findNestEndpoints, type NestEndpoint } from "./nest-endpoints.js";
 import { assignOperationIds, orderEndpoints } from "./nest-modules.js";
+import { matchCall, UrlCallScanner } from "./url-calls.js";
 import { listWorkspacePackages, type WorkspacePackage } from "./workspaces.js";
 
 export interface SliceTarget {
@@ -12,39 +14,63 @@ export interface SliceTarget {
   frontendDirectory: string;
 }
 
-export interface SliceAnalysisOptions {
-  /** NestJS backend workspace, for example `apps/idp-api-service`. */
-  backendDirectory: string;
-  /** Root module file relative to the backend workspace. Defaults to `src/app.module.ts`. */
+/** One backend a slice can reach, and the ways frontends call it. */
+export interface BackendOptions {
+  /** Backend workspace, for example `apps/idp-api-service`. */
+  directory: string;
+  framework: "nestjs" | "express";
+  /** Generated client package frontends call through (NestJS only). */
+  clientPackage?: string;
+  /** NestJS root module relative to the workspace. Defaults to `src/app.module.ts`. */
   rootModule?: string;
-  /** Generated client package the frontends call through. */
-  clientPackage: string;
+  /** Express entry file relative to the workspace. Defaults to `app.js`. */
+  entryFile?: string;
+  /** Names the backend's base URL goes by in frontend code, for matching hand-written requests. */
+  baseUrlNames?: string[];
 }
 
 export interface SliceEndpoint {
+  backendDirectory: string;
   httpMethod: string;
   path: string;
   controller: string;
   methodKey: string;
   file: string;
-  /** Client exports that resolved here. */
+  /** Client exports, or `file:line` request sites, that reach this endpoint. */
   clientNames: string[];
-  /** True when the client name could also mean an endpoint in another controller. */
+  /** True when the call could also mean another endpoint. */
   ambiguous: boolean;
+}
+
+export interface UnmatchedCall {
+  backendDirectory: string;
+  /** Repository-relative file and line of the request. */
+  site: string;
+  method: string | null;
+  path: string;
+}
+
+export interface SliceBackendAnalysis {
+  directory: string;
+  endpointCount: number;
+  /** Repository-relative backend files the endpoints depend on, sorted. */
+  files: string[];
 }
 
 export interface SliceAnalysis {
   name: string;
   frontendDirectory: string;
-  backendDirectory: string;
   entryFiles: string[];
   /** Frontend source files reachable from the entry points, including workspace libraries. */
   frontendFileCount: number;
   endpoints: SliceEndpoint[];
-  /** Repository-relative backend files the endpoints depend on, sorted. */
+  backends: SliceBackendAnalysis[];
+  /** Every backend file across backends, sorted. */
   backendFiles: string[];
   /** Client exports used by the frontend that matched no endpoint. */
   unmatchedClientNames: string[];
+  /** Hand-written requests to a configured backend that matched no route. */
+  unmatchedCalls: UnmatchedCall[];
 }
 
 export interface SliceAnalysisResult {
@@ -62,13 +88,17 @@ function dependsOn(workspace: WorkspacePackage, packageName: string): boolean {
 
 /**
  * Frontends worth slicing when none are configured: every `apps/*` workspace
- * that depends on the client package. Libraries are traced through the apps
- * that import them rather than sliced on their own.
+ * that depends on one of the client packages. Libraries are traced through the
+ * apps that import them rather than sliced on their own.
  */
-export function discoverFrontends(workspaces: WorkspacePackage[], clientPackage: string, backendDirectory: string): SliceTarget[] {
+export function discoverFrontends(
+  workspaces: WorkspacePackage[],
+  clientPackages: string[],
+  backendDirectories: string[]
+): SliceTarget[] {
   return workspaces
-    .filter((workspace) => workspace.directory.startsWith("apps/") && workspace.directory !== backendDirectory)
-    .filter((workspace) => workspace.name !== clientPackage && dependsOn(workspace, clientPackage))
+    .filter((workspace) => workspace.directory.startsWith("apps/") && !backendDirectories.includes(workspace.directory))
+    .filter((workspace) => clientPackages.some((name) => workspace.name !== name && dependsOn(workspace, name)))
     .map((workspace) => ({ name: path.posix.basename(workspace.directory), frontendDirectory: workspace.directory }));
 }
 
@@ -98,17 +128,19 @@ export function findEntryFiles(repositoryDirectory: string, workspace: Workspace
   return entries;
 }
 
+const isPackage = (specifier: string, name: string): boolean => specifier === name || specifier.startsWith(`${name}/`);
+
 /**
  * Walks runtime imports from the entry points, following workspace libraries
- * but stopping at the client package, and collects every name imported from it.
+ * but stopping at client packages, and collects every name imported from each.
  */
 function traceFrontend(
   resolver: ModuleResolver,
   entries: string[],
-  clientPackage: string
-): { files: Set<string>; clientNames: Set<string> } {
+  clientPackages: string[]
+): { files: Set<string>; clientNames: Map<string, Set<string>> } {
   const files = new Set<string>();
-  const clientNames = new Set<string>();
+  const clientNames = new Map(clientPackages.map((name) => [name, new Set<string>()] as const));
   const queue = [...entries];
 
   while (queue.length) {
@@ -118,8 +150,9 @@ function traceFrontend(
     files.add(file);
     const parsed = resolver.parse(file);
     for (const specifier of parsed.specifiers) {
-      if (specifier === clientPackage || specifier.startsWith(`${clientPackage}/`)) {
-        for (const name of parsed.importedNames.get(specifier) ?? []) clientNames.add(name);
+      const clientPackage = clientPackages.find((name) => isPackage(specifier, name));
+      if (clientPackage) {
+        for (const name of parsed.importedNames.get(specifier) ?? []) clientNames.get(clientPackage)!.add(name);
         continue;
       }
       const target = resolver.resolve(file, specifier);
@@ -140,9 +173,13 @@ function traceBackend(resolver: ModuleResolver, starts: string[], backendDirecto
     const relativePath = resolver.relative(file);
     if (!inside(relativePath) || !isApplicationSource(relativePath)) continue;
     files.add(file);
-    for (const specifier of resolver.parse(file).specifiers) {
+    const parsed = resolver.parse(file);
+    for (const specifier of parsed.specifiers) {
       const target = resolver.resolve(file, specifier);
       if (target && !files.has(target)) queue.push(target);
+    }
+    if (parsed.loadsSiblings) {
+      for (const sibling of siblingModules(file)) if (!files.has(sibling)) queue.push(sibling);
     }
   }
   return files;
@@ -153,35 +190,93 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+/** Everything about one backend that does not depend on the frontend. */
+interface PreparedBackend {
+  options: BackendOptions;
+  routes: NestEndpoint[];
+  clientIndex: Map<string, NestEndpoint[]> | null;
+  scanner: UrlCallScanner | null;
+}
+
+async function prepareBackend(
+  repositoryDirectory: string,
+  options: BackendOptions,
+  resolver: ModuleResolver
+): Promise<PreparedBackend> {
+  const { directory } = options;
+  if (options.framework === "express") {
+    const entry = options.entryFile ?? "app.js";
+    if (!existsSync(path.join(repositoryDirectory, directory, entry))) {
+      throw new Error(`Express entry file ${path.posix.join(directory, entry)} was not found`);
+    }
+    const routes = findExpressEndpoints(repositoryDirectory, directory, entry, resolver);
+    if (routes.length === 0) throw new Error(`No Express routes were found from ${path.posix.join(directory, entry)}`);
+    return {
+      options,
+      routes,
+      clientIndex: null,
+      scanner: options.baseUrlNames?.length ? new UrlCallScanner(options.baseUrlNames) : null
+    };
+  }
+
+  const routes = await findNestEndpoints(repositoryDirectory, directory);
+  if (routes.length === 0) throw new Error(`No NestJS controller endpoints were found in ${directory}`);
+  let clientIndex: Map<string, NestEndpoint[]> | null = null;
+  if (options.clientPackage) {
+    const rootModule = path.posix.join(directory, options.rootModule ?? "src/app.module.ts");
+    if (!existsSync(path.join(repositoryDirectory, rootModule))) {
+      throw new Error(`Root module ${rootModule} was not found`);
+    }
+    const { ordered, unreached } = orderEndpoints(repositoryDirectory, rootModule, routes, resolver);
+    const operationIds = new Map<NestEndpoint, string[]>();
+    for (const [endpoint, operationId] of assignOperationIds(ordered)) operationIds.set(endpoint, [operationId]);
+    for (const endpoint of unreached) operationIds.set(endpoint, candidateOperationIds(endpoint));
+    clientIndex = buildClientNameIndex(operationIds);
+  }
+  return {
+    options,
+    routes,
+    clientIndex,
+    scanner: options.baseUrlNames?.length ? new UrlCallScanner(options.baseUrlNames) : null
+  };
+}
+
 /**
- * Traces each target frontend to the backend files it depends on. Pass null
- * targets to discover them. Problems with the backend fail the whole analysis;
- * a frontend that cannot be traced is skipped with a reason.
+ * Traces each target frontend to the backend files it depends on, across every
+ * configured backend. Pass null targets to discover them. Problems with a
+ * backend fail the whole analysis; a frontend that cannot be traced is skipped
+ * with a reason.
  */
 export async function analyzeSlices(
   repositoryDirectory: string,
   requestedTargets: SliceTarget[] | null,
-  options: SliceAnalysisOptions
+  backends: BackendOptions[]
 ): Promise<SliceAnalysisResult> {
+  if (backends.length === 0) throw new Error("Configure at least one backend to slice");
   const workspaces = await listWorkspacePackages(repositoryDirectory);
-  if (!workspaces.some((workspace) => workspace.directory === options.backendDirectory)) {
-    throw new Error(`${options.backendDirectory} is not a pnpm workspace in this repository`);
+  for (const backend of backends) {
+    if (!workspaces.some((workspace) => workspace.directory === backend.directory)) {
+      throw new Error(`${backend.directory} is not a pnpm workspace in this repository`);
+    }
   }
-  const targets = requestedTargets ?? discoverFrontends(workspaces, options.clientPackage, options.backendDirectory);
+  const clientPackages = backends.flatMap((backend) => (backend.clientPackage ? [backend.clientPackage] : []));
+  const targets =
+    requestedTargets ?? discoverFrontends(workspaces, clientPackages, backends.map((backend) => backend.directory));
   const resolver = new ModuleResolver(repositoryDirectory, workspaces);
-  const endpoints = await findNestEndpoints(repositoryDirectory, options.backendDirectory);
-  if (endpoints.length === 0) {
-    throw new Error(`No NestJS controller endpoints were found in ${options.backendDirectory}`);
-  }
-  const rootModule = path.posix.join(options.backendDirectory, options.rootModule ?? "src/app.module.ts");
-  if (!existsSync(path.join(repositoryDirectory, rootModule))) {
-    throw new Error(`Root module ${rootModule} was not found`);
-  }
-  const { ordered, unreached } = orderEndpoints(repositoryDirectory, rootModule, endpoints, resolver);
-  const operationIds = new Map<NestEndpoint, string[]>();
-  for (const [endpoint, operationId] of assignOperationIds(ordered)) operationIds.set(endpoint, [operationId]);
-  for (const endpoint of unreached) operationIds.set(endpoint, candidateOperationIds(endpoint));
-  const clientIndex = buildClientNameIndex(operationIds);
+  const prepared: PreparedBackend[] = [];
+  for (const backend of backends) prepared.push(await prepareBackend(repositoryDirectory, backend, resolver));
+
+  const texts = new Map<string, string>();
+  const readText = (file: string): string => {
+    if (!texts.has(file)) {
+      try {
+        texts.set(file, readFileSync(file, "utf8"));
+      } catch {
+        texts.set(file, "");
+      }
+    }
+    return texts.get(file)!;
+  };
 
   const slices: SliceAnalysis[] = [];
   const skipped: SliceAnalysisResult["skipped"] = [];
@@ -196,50 +291,99 @@ export async function analyzeSlices(
       skipped.push({ frontendDirectory: target.frontendDirectory, reason: "no entry point (index.html script or src/main) was found" });
       continue;
     }
-    const frontend = traceFrontend(resolver, entryFiles, options.clientPackage);
+    const frontend = traceFrontend(resolver, entryFiles, clientPackages);
+    const frontendFiles = Array.from(frontend.files).sort(compareText);
 
-    const matched = new Map<NestEndpoint, { names: Set<string>; ambiguous: boolean }>();
-    const unmatched: string[] = [];
-    for (const name of frontend.clientNames) {
-      const candidates = clientIndex.get(name);
-      if (!candidates) {
-        unmatched.push(name);
-        continue;
+    const matched = new Map<NestEndpoint, { backend: string; names: Set<string>; ambiguous: boolean }>();
+    const add = (backend: string, endpoint: NestEndpoint, name: string, ambiguous: boolean): void => {
+      const entry = matched.get(endpoint) ?? { backend, names: new Set<string>(), ambiguous: false };
+      entry.names.add(name);
+      entry.ambiguous ||= ambiguous;
+      matched.set(endpoint, entry);
+    };
+    const unmatchedClientNames: string[] = [];
+    const unmatchedCalls: UnmatchedCall[] = [];
+
+    for (const backend of prepared) {
+      const { directory, clientPackage } = backend.options;
+      if (backend.clientIndex && clientPackage) {
+        for (const name of frontend.clientNames.get(clientPackage) ?? []) {
+          const candidates = backend.clientIndex.get(name);
+          if (!candidates) {
+            unmatchedClientNames.push(name);
+            continue;
+          }
+          for (const endpoint of candidates) add(directory, endpoint, name, candidates.length > 1);
+        }
       }
-      for (const endpoint of candidates) {
-        const entry = matched.get(endpoint) ?? { names: new Set<string>(), ambiguous: false };
-        entry.names.add(name);
-        entry.ambiguous ||= candidates.length > 1;
-        matched.set(endpoint, entry);
+      if (backend.scanner) {
+        const scanner = backend.scanner;
+        const providers = new Set(frontendFiles.filter((file) => scanner.providesClient(readText(file))));
+        const seenUnmatched = new Set<string>();
+        for (const file of frontendFiles) {
+          const importsClient = resolver
+            .parse(file)
+            .specifiers.some((specifier) => {
+              const resolved = resolver.resolve(file, specifier);
+              return resolved !== null && providers.has(resolved);
+            });
+          for (const call of scanner.scan(file, readText(file), importsClient)) {
+            const site = `${resolver.relative(call.file)}:${call.line}`;
+            const routes = matchCall(call, backend.routes);
+            if (routes.length === 0) {
+              const key = `${call.method ?? "*"} ${call.path} ${site}`;
+              if (!seenUnmatched.has(key)) {
+                seenUnmatched.add(key);
+                unmatchedCalls.push({ backendDirectory: directory, site, method: call.method, path: call.path });
+              }
+              continue;
+            }
+            for (const route of routes) add(directory, route, site, routes.length > 1);
+          }
+        }
       }
     }
 
-    const controllerFiles = Array.from(new Set(Array.from(matched.keys()).map((endpoint) => endpoint.file)));
-    const backendFiles = traceBackend(
-      resolver,
-      controllerFiles.map((file) => path.join(repositoryDirectory, file)),
-      options.backendDirectory
-    );
+    const backendAnalyses: SliceBackendAnalysis[] = [];
+    const allFiles = new Set<string>();
+    for (const backend of prepared) {
+      const directory = backend.options.directory;
+      const endpoints = Array.from(matched.entries()).filter(([, entry]) => entry.backend === directory);
+      const handlerFiles = Array.from(new Set(endpoints.map(([endpoint]) => endpoint.file)));
+      const files = Array.from(
+        traceBackend(resolver, handlerFiles.map((file) => path.join(repositoryDirectory, file)), directory),
+        (file) => resolver.relative(file)
+      ).sort(compareText);
+      for (const file of files) allFiles.add(file);
+      backendAnalyses.push({ directory, endpointCount: endpoints.length, files });
+    }
 
     slices.push({
       name: target.name,
       frontendDirectory: target.frontendDirectory,
-      backendDirectory: options.backendDirectory,
       entryFiles: entryFiles.map((file) => resolver.relative(file)),
       frontendFileCount: frontend.files.size,
       endpoints: Array.from(matched.entries())
         .map(([endpoint, entry]) => ({
+          backendDirectory: entry.backend,
           httpMethod: endpoint.httpMethod,
           path: endpoint.path,
           controller: endpoint.controller,
           methodKey: endpoint.methodKey,
           file: endpoint.file,
-          clientNames: Array.from(entry.names).sort(),
+          clientNames: Array.from(entry.names).sort(compareText),
           ambiguous: entry.ambiguous
         }))
-        .sort((left, right) => compareText(left.path, right.path) || compareText(left.httpMethod, right.httpMethod)),
-      backendFiles: Array.from(backendFiles, (file) => resolver.relative(file)).sort(),
-      unmatchedClientNames: unmatched.sort()
+        .sort(
+          (left, right) =>
+            compareText(left.backendDirectory, right.backendDirectory) ||
+            compareText(left.path, right.path) ||
+            compareText(left.httpMethod, right.httpMethod)
+        ),
+      backends: backendAnalyses,
+      backendFiles: Array.from(allFiles).sort(compareText),
+      unmatchedClientNames: unmatchedClientNames.sort(compareText),
+      unmatchedCalls: unmatchedCalls.sort((left, right) => compareText(left.site, right.site))
     });
   }
   return { slices, skipped };

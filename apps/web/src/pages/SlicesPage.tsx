@@ -5,6 +5,8 @@ import {
   type CoverageMetricName,
   type Repository,
   type Slice,
+  type SliceBackendConfig,
+  type SliceBackendFramework,
   type SliceBuild,
   type SliceConfig,
   type SliceOverview
@@ -47,6 +49,39 @@ function parseList(value: string): string[] {
     .filter(Boolean);
 }
 
+interface BackendDraft {
+  key: number;
+  directory: string;
+  framework: SliceBackendFramework;
+  clientPackage: string;
+  rootModule: string;
+  entryFile: string;
+  baseUrlNames: string;
+}
+
+let draftKey = 0;
+function toDraft(backend?: SliceBackendConfig): BackendDraft {
+  draftKey += 1;
+  return {
+    key: draftKey,
+    directory: backend?.directory ?? "",
+    framework: backend?.framework ?? "nestjs",
+    clientPackage: backend?.clientPackage ?? "",
+    rootModule: backend?.rootModule ?? "src/app.module.ts",
+    entryFile: backend?.entryFile ?? "app.js",
+    baseUrlNames: backend?.baseUrlNames.join(", ") ?? ""
+  };
+}
+
+export function describeRecipe(config: SliceConfig | null): string {
+  if (!config) return "Not set up yet";
+  const backends = config.backends.map((backend) => backend.directory.split("/").at(-1)).join(" + ");
+  const frontends = config.frontendDirectories.length
+    ? `${config.frontendDirectories.length} frontend${config.frontendDirectories.length === 1 ? "" : "s"}`
+    : "every app using a client";
+  return `${backends} · ${frontends}`;
+}
+
 function SliceSetup({
   repositoryId,
   config,
@@ -56,12 +91,14 @@ function SliceSetup({
   config: SliceConfig | null;
   onSaved: (config: SliceConfig) => void;
 }) {
-  const [backendDirectory, setBackendDirectory] = useState(config?.backendDirectory ?? "");
-  const [clientPackage, setClientPackage] = useState(config?.clientPackage ?? "");
-  const [rootModule, setRootModule] = useState(config?.rootModule ?? "src/app.module.ts");
+  const [backends, setBackends] = useState<BackendDraft[]>(() => (config?.backends.length ? config.backends.map(toDraft) : [toDraft()]));
   const [frontends, setFrontends] = useState(config?.frontendDirectories.join(", ") ?? "");
+  const [open, setOpen] = useState(!config);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+
+  const update = (key: number, patch: Partial<BackendDraft>) =>
+    setBackends((current) => current.map((backend) => (backend.key === key ? { ...backend, ...patch } : backend)));
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -70,9 +107,20 @@ function SliceSetup({
     try {
       const response = await api<{ config: SliceConfig }>(`/api/repositories/${repositoryId}/slices/config`, {
         method: "PUT",
-        body: JSON.stringify({ backendDirectory, clientPackage, rootModule, frontendDirectories: parseList(frontends) })
+        body: JSON.stringify({
+          backends: backends.map((backend) => ({
+            directory: backend.directory,
+            framework: backend.framework,
+            clientPackage: backend.framework === "nestjs" ? backend.clientPackage : null,
+            rootModule: backend.framework === "nestjs" ? backend.rootModule : null,
+            entryFile: backend.framework === "express" ? backend.entryFile : null,
+            baseUrlNames: parseList(backend.baseUrlNames)
+          })),
+          frontendDirectories: parseList(frontends)
+        })
       });
       onSaved(response.config);
+      setOpen(false);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to save the slice setup");
     } finally {
@@ -81,43 +129,82 @@ function SliceSetup({
   };
 
   return (
-    <details className="panel slice-setup" open={!config}>
+    <details className="panel slice-setup" open={open} onToggle={(event) => setOpen((event.currentTarget as HTMLDetailsElement).open)}>
       <summary>
-        <span><span className="eyebrow">Recipe</span><strong>Slice setup</strong></span>
-        <span className="muted">
-          {config
-            ? `${config.backendDirectory} · ${config.frontendDirectories.length ? `${config.frontendDirectories.length} frontends` : "every app using the client"}`
-            : "Not set up yet"}
+        <span className="slice-setup-title">
+          <Icon name="chevron" size={14} />
+          <span><span className="eyebrow">Recipe</span><strong>Slice setup</strong></span>
+        </span>
+        <span className="slice-setup-meta">
+          <span className="muted">{describeRecipe(config)}</span>
+          <span className="slice-setup-toggle">{open ? "Close" : config ? "Edit recipe" : "Set up"}</span>
         </span>
       </summary>
       <form className="slice-setup-form" onSubmit={(event) => void save(event)}>
         <p className="muted">
-          A slice is every backend file one frontend depends on: QA Buddy follows the frontend's imports to the
-          generated API client calls it makes, matches them to the NestJS controllers that serve them, and follows the
-          controllers' imports. Shared code belongs to every slice that uses it.
+          A slice is every backend file one frontend depends on. QA Buddy follows the frontend&apos;s imports to the
+          requests it makes, matches them to backend routes, and follows those routes&apos; imports. Requests are
+          recognised two ways: calls through a generated API client, and hand-written URLs built from a base URL
+          variable. Shared code belongs to every slice that uses it.
         </p>
-        <div className="slice-setup-grid">
-          <label>
-            <span>Backend workspace</span>
-            <input value={backendDirectory} onChange={(event) => setBackendDirectory(event.target.value)} placeholder="apps/idp-api-service" required />
-            <small>The NestJS app whose coverage the slices measure.</small>
-          </label>
-          <label>
-            <span>Generated client package</span>
-            <input value={clientPackage} onChange={(event) => setClientPackage(event.target.value)} placeholder="@acme/api-client" required />
-            <small>The orval client the frontends import endpoint calls from.</small>
-          </label>
-          <label>
-            <span>Root module</span>
-            <input value={rootModule} onChange={(event) => setRootModule(event.target.value)} placeholder="src/app.module.ts" />
-            <small>Relative to the backend workspace. Used to match operation ids exactly.</small>
-          </label>
-          <label>
-            <span>Frontends</span>
-            <input value={frontends} onChange={(event) => setFrontends(event.target.value)} placeholder="Every apps/* workspace using the client" />
-            <small>Comma separated, for example apps/idinspect, apps/idcloud. Leave blank for all.</small>
-          </label>
-        </div>
+        {backends.map((backend, index) => (
+          <fieldset key={backend.key} className="slice-backend">
+            <legend>Backend {index + 1}</legend>
+            <div className="slice-setup-grid">
+              <label>
+                <span>Workspace</span>
+                <input value={backend.directory} onChange={(event) => update(backend.key, { directory: event.target.value })} placeholder="apps/idp-api-service" required />
+                <small>Its coverage must come from a tested app in QA Buddy.</small>
+              </label>
+              <label>
+                <span>Framework</span>
+                <select value={backend.framework} onChange={(event) => update(backend.key, { framework: event.target.value as SliceBackendFramework })}>
+                  <option value="nestjs">NestJS</option>
+                  <option value="express">Express</option>
+                </select>
+                <small>How routes are discovered.</small>
+              </label>
+              {backend.framework === "nestjs" ? (
+                <>
+                  <label>
+                    <span>Generated client package</span>
+                    <input value={backend.clientPackage} onChange={(event) => update(backend.key, { clientPackage: event.target.value })} placeholder="@acme/api-client" />
+                    <small>The orval client frontends import endpoint calls from.</small>
+                  </label>
+                  <label>
+                    <span>Root module</span>
+                    <input value={backend.rootModule} onChange={(event) => update(backend.key, { rootModule: event.target.value })} placeholder="src/app.module.ts" />
+                    <small>Relative to the workspace. Used to match operation ids exactly.</small>
+                  </label>
+                </>
+              ) : (
+                <label>
+                  <span>Entry file</span>
+                  <input value={backend.entryFile} onChange={(event) => update(backend.key, { entryFile: event.target.value })} placeholder="app.js" />
+                  <small>The file that creates the Express app and mounts its routers.</small>
+                </label>
+              )}
+              <label className={backend.framework === "express" ? "" : "field-span"}>
+                <span>Base URL names</span>
+                <input value={backend.baseUrlNames} onChange={(event) => update(backend.key, { baseUrlNames: event.target.value })} placeholder="VITE_API_HOST, apiHost" />
+                <small>Variables or props frontends build this backend&apos;s URLs from. Comma separated.</small>
+              </label>
+            </div>
+            {backends.length > 1 && (
+              <button type="button" className="button button-ghost button-small" onClick={() => setBackends((current) => current.filter((candidate) => candidate.key !== backend.key))}>
+                Remove backend
+              </button>
+            )}
+          </fieldset>
+        ))}
+        <button type="button" className="button button-secondary button-small" onClick={() => setBackends((current) => [...current, toDraft({ directory: "", framework: "express", clientPackage: null, rootModule: null, entryFile: "app.js", baseUrlNames: [] })])}>
+          <Icon name="plus" size={14} />Add backend
+        </button>
+        <label className="slice-frontends">
+          <span>Frontends</span>
+          <input value={frontends} onChange={(event) => setFrontends(event.target.value)} placeholder="Every apps/* workspace using a client package" />
+          <small>Comma separated, for example apps/idinspect, apps/idcloud. Leave blank for every app that depends on a generated client.</small>
+        </label>
         {error && <p className="inline-error slice-setup-error" role="alert">{error}</p>}
         <div className="slice-setup-actions">
           <button type="submit" className="button button-primary" disabled={saving}>{saving ? "Saving…" : "Save recipe"}</button>
@@ -171,10 +258,24 @@ function SliceCard({ repositoryId, slice, metric }: { repositoryId: string; slic
           <span className="muted">{sliceMetricLabels[metric]}{value ? ` · ${value.covered.toLocaleString()}/${value.total.toLocaleString()}` : ""}</span>
         </div>
       </div>
+      {slice.backends.length > 1 && (
+        <ul className="slice-card-backends" aria-label="Coverage by backend">
+          {slice.backends.map((backend) => {
+            const backendValue = backend.coverage[metric];
+            return (
+              <li key={backend.directory}>
+                <code>{backend.directory.split("/").at(-1)}</code>
+                <span className="slice-backend-bar"><span className={`slice-backend-fill slice-percent-${coverageTone(backendValue?.percent)}`} style={{ width: `${backendValue?.percent ?? 0}%` }} /></span>
+                <strong>{formatPercentValue(backendValue?.percent)}</strong>
+              </li>
+            );
+          })}
+        </ul>
+      )}
       <dl className="slice-card-facts">
         <div><dt>Endpoints</dt><dd>{slice.endpointCount}</dd></div>
         <div><dt>Backend files</dt><dd>{slice.fileCount}</dd></div>
-        <div><dt>Measured</dt><dd title="Slice files that appear in the latest coverage report">{slice.measuredFileCount}</dd></div>
+        <div><dt>Measured</dt><dd title="Slice files that appear in the latest coverage reports">{slice.measuredFileCount}</dd></div>
       </dl>
     </Link>
   );

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { QaBuddyDatabase } from "@qa-buddy/db";
 import type { RepositoryInput } from "@qa-buddy/shared";
 import { executeSliceBuild, sliceBuildLogName } from "./build.js";
-import { CLIENT, writeFixture } from "./test-fixture.js";
+import { CLIENT, EXPRESS_BACKEND, writeFixture } from "./test-fixture.js";
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, {
@@ -66,9 +66,10 @@ describe("slice builds", () => {
 
   it("traces the configured frontends from a checkout and stores the slices", async () => {
     database.setSliceConfig(repositoryId, {
-      backendDirectory: "apps/api",
-      clientPackage: CLIENT,
-      rootModule: "src/app.module.ts",
+      backends: [
+        { directory: "apps/api", framework: "nestjs", clientPackage: CLIENT, rootModule: "src/app.module.ts", entryFile: null, baseUrlNames: [] },
+        { ...EXPRESS_BACKEND, clientPackage: null, rootModule: null }
+      ],
       frontendDirectories: ["apps/inspect", "apps/scout", "apps/gone"]
     });
     const build = database.createSliceBuild(repositoryId, undefined, true);
@@ -82,13 +83,16 @@ describe("slice builds", () => {
     });
     expect(finished.resolvedSha).toMatch(/^[0-9a-f]{40}$/);
     const slices = database.listSlices(repositoryId);
-    expect(slices.map((slice) => [slice.name, slice.endpointCount, slice.fileCount])).toEqual([
-      ["inspect", 3, 4],
-      ["scout", 2, 2]
+    expect(slices.map((slice) => [slice.name, slice.endpointCount, slice.backends.map((backend) => [backend.directory, backend.endpointCount, backend.fileCount])])).toEqual([
+      ["inspect", 8, [["apps/api", 3, 4], ["apps/legacy", 5, 7]]],
+      ["scout", 2, [["apps/api", 2, 2], ["apps/legacy", 0, 0]]]
+    ]);
+    expect(database.getSlice(repositoryId, "inspect")!.unmatchedCalls).toEqual([
+      { backendDirectory: "apps/legacy", site: "apps/inspect/src/legacy-calls.ts:13", method: "patch", path: "/nowhere/{}" }
     ]);
     expect(database.getSlice(repositoryId, "inspect")!.endpoints[0]).not.toHaveProperty("ambiguous");
     expect(readFileSync(path.join(root, "data", "logs", `${sliceBuildLogName(build.id)}.log`), "utf8")).toContain(
-      "Sliced apps/inspect: 3 endpoints, 4 backend files"
+      "Sliced apps/inspect: apps/api 3 endpoints / 4 files; apps/legacy 5 endpoints / 7 files"
     );
     // The temporary checkout is always removed.
     expect(existsSync(path.join(root, "workspaces")) ? readdirSync(path.join(root, "workspaces")) : []).toEqual([]);
@@ -96,12 +100,10 @@ describe("slice builds", () => {
 
   it("fails the build with a clear reason and keeps the previous slices", async () => {
     database.replaceSlices(repositoryId, "earlier", "abc", [
-      { name: "inspect", frontendDirectory: "apps/inspect", backendDirectory: "apps/api", endpoints: [], files: ["apps/api/src/x.ts"] }
+      { name: "inspect", frontendDirectory: "apps/inspect", endpoints: [], backends: [{ directory: "apps/api", endpointCount: 0, files: ["apps/api/src/x.ts"] }] }
     ]);
     database.setSliceConfig(repositoryId, {
-      backendDirectory: "apps/missing-api",
-      clientPackage: CLIENT,
-      rootModule: "src/app.module.ts",
+      backends: [{ directory: "apps/missing-api", framework: "nestjs", clientPackage: CLIENT, rootModule: "src/app.module.ts", entryFile: null, baseUrlNames: [] }],
       frontendDirectories: []
     });
     const build = database.createSliceBuild(repositoryId, undefined, true);
@@ -116,15 +118,13 @@ describe("slice builds", () => {
 
   it("explains when no app depends on the client package", async () => {
     database.setSliceConfig(repositoryId, {
-      backendDirectory: "apps/api",
-      clientPackage: CLIENT,
-      rootModule: "src/app.module.ts",
+      backends: [{ directory: "apps/api", framework: "nestjs", clientPackage: CLIENT, rootModule: "src/app.module.ts", entryFile: null, baseUrlNames: [] }],
       frontendDirectories: []
     });
     const build = database.createSliceBuild(repositoryId, undefined, true);
     await executeSliceBuild(database.claimNextSliceBuild()!, options());
     expect(database.getSliceBuild(build.id)?.error).toBe(
-      `No apps/* workspace depends on ${CLIENT}; list the frontends to slice explicitly`
+      "No apps/* workspace depends on a configured client package; list the frontends to slice explicitly"
     );
   });
 });
