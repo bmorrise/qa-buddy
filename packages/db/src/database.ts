@@ -23,9 +23,15 @@ import type {
   RunDetail,
   RunStatus,
   RunSummary,
+  Slice,
+  SliceBuild,
+  SliceBuildStatus,
+  SliceConfig,
+  SliceDetail,
+  SliceEndpoint,
   TestResults
 } from "@qa-buddy/shared";
-import { activeRunStatuses, coverageMetricNames, terminalRunStatuses } from "@qa-buddy/shared";
+import { activeRunStatuses, activeSliceBuildStatuses, coverageMetricNames, terminalRunStatuses } from "@qa-buddy/shared";
 
 const initialMigrationSql = `
   CREATE TABLE repositories (
@@ -267,6 +273,78 @@ const migrations = [
   {
     version: 16,
     sql: "ALTER TABLE repositories ADD COLUMN excluded_workspaces_json TEXT NOT NULL DEFAULT '[]';"
+  },
+  {
+    version: 17,
+    // Slices: the backend files each frontend depends on. slices.build_id and
+    // slice_history.run_id are not foreign keys so slices and their trend
+    // survive build and run pruning, like coverage snapshots and history.
+    sql: `
+      ALTER TABLE repositories ADD COLUMN slice_config_json TEXT;
+
+      CREATE TABLE slice_builds (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+        status TEXT NOT NULL,
+        requested_ref TEXT NOT NULL,
+        use_local_working_tree INTEGER NOT NULL DEFAULT 0,
+        resolved_sha TEXT,
+        dirty INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        slice_count INTEGER,
+        skipped_json TEXT NOT NULL DEFAULT '[]',
+        config_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT
+      );
+      CREATE INDEX slice_builds_repository_idx ON slice_builds(repository_id, created_at DESC);
+
+      CREATE TABLE slices (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+        build_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        frontend_directory TEXT NOT NULL,
+        backend_directory TEXT NOT NULL,
+        resolved_sha TEXT,
+        built_at TEXT NOT NULL,
+        endpoint_count INTEGER NOT NULL,
+        file_count INTEGER NOT NULL,
+        endpoints_json TEXT NOT NULL,
+        UNIQUE(repository_id, name COLLATE NOCASE)
+      );
+
+      CREATE TABLE slice_files (
+        slice_id TEXT NOT NULL REFERENCES slices(id) ON DELETE CASCADE,
+        file_path TEXT NOT NULL,
+        PRIMARY KEY (slice_id, file_path)
+      );
+      CREATE INDEX slice_files_path_idx ON slice_files(file_path);
+      CREATE INDEX coverage_files_path_idx ON coverage_files(file_path);
+
+      CREATE TABLE slice_history (
+        run_id TEXT NOT NULL,
+        repository_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+        slice_name TEXT NOT NULL,
+        requested_ref TEXT NOT NULL,
+        resolved_sha TEXT,
+        use_local_working_tree INTEGER NOT NULL,
+        dirty INTEGER NOT NULL,
+        recorded_at TEXT NOT NULL,
+        lines_covered INTEGER,
+        lines_total INTEGER,
+        statements_covered INTEGER,
+        statements_total INTEGER,
+        functions_covered INTEGER,
+        functions_total INTEGER,
+        branches_covered INTEGER,
+        branches_total INTEGER,
+        measured_files INTEGER NOT NULL,
+        PRIMARY KEY (run_id, slice_name)
+      );
+      CREATE INDEX slice_history_repository_idx ON slice_history(repository_id, recorded_at ASC);
+    `
   }
 ] as const;
 
@@ -385,8 +463,89 @@ interface CoverageFileRowRecord {
   branches_total: number | null;
 }
 
+interface SliceBuildRow {
+  id: string;
+  repository_id: string;
+  status: SliceBuildStatus;
+  requested_ref: string;
+  use_local_working_tree: number;
+  resolved_sha: string | null;
+  dirty: number;
+  error: string | null;
+  slice_count: number | null;
+  skipped_json: string;
+  config_json: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+type SliceRow = {
+  id: string;
+  repository_id: string;
+  build_id: string;
+  name: string;
+  frontend_directory: string;
+  backend_directory: string;
+  resolved_sha: string | null;
+  built_at: string;
+  endpoint_count: number;
+  file_count: number;
+  endpoints_json: string;
+  measured_files: number;
+  /** `captured_at|resolved_sha` of the newest snapshot a slice file came from. */
+  coverage_source: string | null;
+} & Record<`${CoverageMetricName}_${"covered" | "total"}`, number | null>;
+
+type SliceHistoryRow = {
+  run_id: string;
+  slice_name: string;
+  requested_ref: string;
+  resolved_sha: string | null;
+  use_local_working_tree: number;
+  dirty: number;
+  recorded_at: string;
+} & Record<`${CoverageMetricName}_${"covered" | "total"}`, number | null>;
+
+/** A slice as traced by the worker, ready to store. */
+export interface SliceInput {
+  name: string;
+  frontendDirectory: string;
+  backendDirectory: string;
+  endpoints: SliceEndpoint[];
+  files: string[];
+}
+
 function now(): string {
   return new Date().toISOString();
+}
+
+function percentMetric(covered: number | null, total: number | null) {
+  return covered === null || total === null
+    ? null
+    : { covered, total, percent: total === 0 ? null : Math.round((covered / total) * 1_000) / 10 };
+}
+
+/**
+ * Sums per-file coverage into one summary. A metric is null when no file
+ * reported it, so slices without measured files never read as 0%.
+ */
+export function sumCoverage(files: Array<Pick<CoverageFileEntry, CoverageMetricName>>): CoverageSummary {
+  const summary = {} as CoverageSummary;
+  for (const metric of coverageMetricNames) {
+    let covered = 0;
+    let total = 0;
+    let reported = false;
+    for (const file of files) {
+      const value = file[metric];
+      if (!value) continue;
+      reported = true;
+      covered += value.covered;
+      total += value.total;
+    }
+    summary[metric] = reported ? percentMetric(covered, total) : null;
+  }
+  return summary;
 }
 
 function placeholders(values: readonly unknown[]): string {
@@ -1079,6 +1238,13 @@ export class QaBuddyDatabase {
       conditions.push("s.app_name = ? COLLATE NOCASE");
       parameters.push(query.appName);
     }
+    if (query.sliceName) {
+      conditions.push(`f.file_path IN (
+        SELECT sf.file_path FROM slice_files sf JOIN slices sl ON sl.id = sf.slice_id
+        WHERE sl.repository_id = s.repository_id AND sl.name = ? COLLATE NOCASE
+      )`);
+      parameters.push(query.sliceName);
+    }
     if (query.search) {
       conditions.push("f.file_path LIKE ? ESCAPE '\\'");
       parameters.push(`%${query.search.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`);
@@ -1352,4 +1518,377 @@ export class QaBuddyDatabase {
       .run(...ids);
     return ids;
   }
+
+  // ----- Slices ------------------------------------------------------------------------
+
+  getSliceConfig(repositoryId: string): SliceConfig | null {
+    const row = this.connection
+      .prepare("SELECT slice_config_json FROM repositories WHERE id = ?")
+      .get(repositoryId) as { slice_config_json: string | null } | undefined;
+    return row?.slice_config_json ? (JSON.parse(row.slice_config_json) as SliceConfig) : null;
+  }
+
+  setSliceConfig(repositoryId: string, config: SliceConfig): SliceConfig {
+    const result = this.connection
+      .prepare("UPDATE repositories SET slice_config_json = ?, updated_at = ? WHERE id = ?")
+      .run(JSON.stringify(config), now(), repositoryId);
+    if (result.changes === 0) throw new Error("Repository not found");
+    return config;
+  }
+
+  private mapSliceBuild(row: SliceBuildRow): SliceBuild {
+    return {
+      id: row.id,
+      repositoryId: row.repository_id,
+      status: row.status,
+      requestedRef: row.requested_ref,
+      useLocalWorkingTree: row.use_local_working_tree === 1,
+      resolvedSha: row.resolved_sha,
+      dirty: row.dirty === 1,
+      error: row.error,
+      sliceCount: row.slice_count,
+      skipped: JSON.parse(row.skipped_json) as SliceBuild["skipped"],
+      config: JSON.parse(row.config_json) as SliceConfig,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at
+    };
+  }
+
+  getSliceBuild(id: string): SliceBuild | null {
+    const row = this.connection.prepare("SELECT * FROM slice_builds WHERE id = ?").get(id) as SliceBuildRow | undefined;
+    return row ? this.mapSliceBuild(row) : null;
+  }
+
+  listSliceBuilds(repositoryId: string, limit = 10): SliceBuild[] {
+    const rows = this.connection
+      .prepare("SELECT * FROM slice_builds WHERE repository_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
+      .all(repositoryId, limit) as SliceBuildRow[];
+    return rows.map((row) => this.mapSliceBuild(row));
+  }
+
+  /** Queues a slice build. Only one build per repository may be queued or running. */
+  createSliceBuild(repositoryId: string, requestedRef?: string, useLocalWorkingTree = false): SliceBuild {
+    const repository = this.getRepository(repositoryId);
+    if (!repository) throw new Error("Repository not found");
+    const config = this.getSliceConfig(repositoryId);
+    if (!config) throw new Error("Set up slices for this repository before building them");
+    if (useLocalWorkingTree && !repository.localPath) {
+      throw new Error("This repository has no local checkout path configured");
+    }
+    const id = randomUUID();
+    this.connection.transaction(() => {
+      const active = this.connection
+        .prepare(`SELECT id FROM slice_builds WHERE repository_id = ? AND status IN (${placeholders(activeSliceBuildStatuses)})`)
+        .get(repositoryId, ...activeSliceBuildStatuses);
+      if (active) throw new Error("This repository already has a slice build in progress");
+      this.connection
+        .prepare(`
+          INSERT INTO slice_builds(id, repository_id, status, requested_ref, use_local_working_tree, config_json, created_at)
+          VALUES (?, ?, 'queued', ?, ?, ?, ?)
+        `)
+        .run(
+          id,
+          repositoryId,
+          useLocalWorkingTree ? "local working tree" : requestedRef ?? repository.defaultRef,
+          useLocalWorkingTree ? 1 : 0,
+          JSON.stringify(config),
+          now()
+        );
+    }).immediate();
+    return this.getSliceBuild(id)!;
+  }
+
+  claimNextSliceBuild(): SliceBuild | null {
+    const id = this.connection.transaction(() => {
+      const row = this.connection
+        .prepare("SELECT id FROM slice_builds WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC LIMIT 1")
+        .get() as { id: string } | undefined;
+      if (!row) return null;
+      const result = this.connection
+        .prepare("UPDATE slice_builds SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'")
+        .run(now(), row.id);
+      return result.changes === 1 ? row.id : null;
+    }).immediate();
+    return id ? this.getSliceBuild(id) : null;
+  }
+
+  setSliceBuildSource(id: string, resolvedSha: string, dirty: boolean): void {
+    this.connection
+      .prepare("UPDATE slice_builds SET resolved_sha = ?, dirty = ? WHERE id = ?")
+      .run(resolvedSha, dirty ? 1 : 0, id);
+  }
+
+  finishSliceBuild(
+    id: string,
+    values: { status: Extract<SliceBuildStatus, "passed" | "failed">; error?: string | null; sliceCount?: number; skipped?: SliceBuild["skipped"] }
+  ): void {
+    this.connection
+      .prepare("UPDATE slice_builds SET status = ?, error = ?, slice_count = ?, skipped_json = ?, finished_at = ? WHERE id = ?")
+      .run(values.status, values.error ?? null, values.sliceCount ?? null, JSON.stringify(values.skipped ?? []), now(), id);
+  }
+
+  /** Fails builds a restarted worker can no longer finish. */
+  markActiveSliceBuildsFailed(): string[] {
+    const rows = this.connection.prepare("SELECT id FROM slice_builds WHERE status = 'running'").all() as Array<{ id: string }>;
+    for (const { id } of rows) {
+      this.finishSliceBuild(id, { status: "failed", error: "Worker restarted while this slice build was running" });
+    }
+    return rows.map((row) => row.id);
+  }
+
+  pruneSliceBuilds(repositoryId: string, keep: number): string[] {
+    const rows = this.connection
+      .prepare(`
+        SELECT id FROM slice_builds WHERE repository_id = ? AND status NOT IN (${placeholders(activeSliceBuildStatuses)})
+        ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+      `)
+      .all(repositoryId, ...activeSliceBuildStatuses, keep) as Array<{ id: string }>;
+    if (rows.length === 0) return [];
+    const ids = rows.map((row) => row.id);
+    this.connection.prepare(`DELETE FROM slice_builds WHERE id IN (${placeholders(ids)})`).run(...ids);
+    return ids;
+  }
+
+  /**
+   * Replaces every slice in the repository with a fresh build's result, then
+   * seeds each slice's trend with a point from the current coverage snapshot so
+   * the chart has a starting value before the next run.
+   */
+  replaceSlices(repositoryId: string, buildId: string, resolvedSha: string | null, slices: SliceInput[]): void {
+    const timestamp = now();
+    this.connection.transaction(() => {
+      this.connection.prepare("DELETE FROM slices WHERE repository_id = ?").run(repositoryId);
+      const insertSlice = this.connection.prepare(`
+        INSERT INTO slices(
+          id, repository_id, build_id, name, frontend_directory, backend_directory,
+          resolved_sha, built_at, endpoint_count, file_count, endpoints_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insertFile = this.connection.prepare("INSERT OR IGNORE INTO slice_files(slice_id, file_path) VALUES (?, ?)");
+      for (const slice of slices) {
+        const sliceId = randomUUID();
+        insertSlice.run(
+          sliceId,
+          repositoryId,
+          buildId,
+          slice.name,
+          slice.frontendDirectory,
+          slice.backendDirectory,
+          resolvedSha,
+          timestamp,
+          slice.endpoints.length,
+          new Set(slice.files).size,
+          JSON.stringify(slice.endpoints)
+        );
+        for (const file of slice.files) insertFile.run(sliceId, file);
+      }
+      this.seedSliceHistory(repositoryId);
+    })();
+  }
+
+  /** Records each slice's coverage from the snapshot it is currently measured against, once per run. */
+  private seedSliceHistory(repositoryId: string): void {
+    for (const slice of this.listSlices(repositoryId)) {
+      if (slice.measuredFileCount === 0 || !slice.coverageCapturedAt) continue;
+      const snapshot = this.connection
+        .prepare(`
+          SELECT s.run_id, s.resolved_sha, s.captured_at, h.requested_ref
+          FROM coverage_snapshots s
+          LEFT JOIN coverage_history h ON h.run_id = s.run_id AND h.app_name = s.app_name
+          WHERE s.repository_id = ? AND s.captured_at = ? AND s.run_id IS NOT NULL
+          LIMIT 1
+        `)
+        .get(repositoryId, slice.coverageCapturedAt) as
+        | { run_id: string; resolved_sha: string | null; captured_at: string; requested_ref: string | null }
+        | undefined;
+      if (!snapshot) continue;
+      this.insertSliceHistory({
+        repositoryId,
+        runId: snapshot.run_id,
+        sliceName: slice.name,
+        requestedRef: snapshot.requested_ref ?? "snapshot",
+        resolvedSha: snapshot.resolved_sha,
+        useLocalWorkingTree: false,
+        dirty: false,
+        recordedAt: snapshot.captured_at,
+        coverage: slice.coverage,
+        measuredFiles: slice.measuredFileCount,
+        replace: false
+      });
+    }
+  }
+
+  private insertSliceHistory(values: {
+    repositoryId: string;
+    runId: string;
+    sliceName: string;
+    requestedRef: string;
+    resolvedSha: string | null;
+    useLocalWorkingTree: boolean;
+    dirty: boolean;
+    recordedAt: string;
+    coverage: CoverageSummary;
+    measuredFiles: number;
+    replace: boolean;
+  }): void {
+    this.connection
+      .prepare(`
+        INSERT OR ${values.replace ? "REPLACE" : "IGNORE"} INTO slice_history(
+          run_id, repository_id, slice_name, requested_ref, resolved_sha,
+          use_local_working_tree, dirty, recorded_at, ${coverageMetricColumns}, measured_files
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        values.runId,
+        values.repositoryId,
+        values.sliceName,
+        values.requestedRef,
+        values.resolvedSha,
+        values.useLocalWorkingTree ? 1 : 0,
+        values.dirty ? 1 : 0,
+        values.recordedAt,
+        ...coverageMetricNames.flatMap((metric) => [
+          values.coverage[metric]?.covered ?? null,
+          values.coverage[metric]?.total ?? null
+        ]),
+        values.measuredFiles
+      );
+  }
+
+  /**
+   * Records one run's coverage for every slice measured against the app that
+   * just finished. Returns how many slice points were written.
+   */
+  recordSliceHistory(values: {
+    repositoryId: string;
+    runId: string;
+    requestedRef: string;
+    resolvedSha: string | null;
+    useLocalWorkingTree: boolean;
+    dirty: boolean;
+    workingDirectory: string;
+    files: CoverageFileEntry[];
+  }): number {
+    const slices = this.connection
+      .prepare("SELECT id, name FROM slices WHERE repository_id = ? AND backend_directory = ?")
+      .all(values.repositoryId, values.workingDirectory) as Array<{ id: string; name: string }>;
+    if (slices.length === 0 || values.files.length === 0) return 0;
+    const byPath = new Map(values.files.map((file) => [file.path, file] as const));
+    const recordedAt = now();
+    let written = 0;
+    this.connection.transaction(() => {
+      for (const slice of slices) {
+        const paths = this.connection
+          .prepare("SELECT file_path FROM slice_files WHERE slice_id = ?")
+          .all(slice.id) as Array<{ file_path: string }>;
+        const measured = paths.flatMap(({ file_path }) => {
+          const file = byPath.get(file_path);
+          return file ? [file] : [];
+        });
+        if (measured.length === 0) continue;
+        this.insertSliceHistory({
+          repositoryId: values.repositoryId,
+          runId: values.runId,
+          sliceName: slice.name,
+          requestedRef: values.requestedRef,
+          resolvedSha: values.resolvedSha,
+          useLocalWorkingTree: values.useLocalWorkingTree,
+          dirty: values.dirty,
+          recordedAt,
+          coverage: sumCoverage(measured),
+          measuredFiles: measured.length,
+          replace: true
+        });
+        written += 1;
+      }
+    })();
+    return written;
+  }
+
+  private mapSlice(row: SliceRow): Slice {
+    const [capturedAt, sha] = row.coverage_source ? row.coverage_source.split("|") : [null, null];
+    return {
+      name: row.name,
+      frontendDirectory: row.frontend_directory,
+      backendDirectory: row.backend_directory,
+      buildId: row.build_id,
+      resolvedSha: row.resolved_sha,
+      builtAt: row.built_at,
+      endpointCount: row.endpoint_count,
+      fileCount: row.file_count,
+      measuredFileCount: row.measured_files,
+      coverage: {
+        lines: row.measured_files ? percentMetric(row.lines_covered, row.lines_total) : null,
+        statements: row.measured_files ? percentMetric(row.statements_covered, row.statements_total) : null,
+        functions: row.measured_files ? percentMetric(row.functions_covered, row.functions_total) : null,
+        branches: row.measured_files ? percentMetric(row.branches_covered, row.branches_total) : null
+      },
+      coverageCapturedAt: capturedAt || null,
+      coverageSha: sha || null
+    };
+  }
+
+  /**
+   * Current slice coverage, summed from the coverage snapshots in the same
+   * repository. Only files under the slice's backend directory are joined, so
+   * another app's report that happens to list the same path cannot count twice.
+   */
+  private sliceRows(repositoryId: string, sliceName?: string): SliceRow[] {
+    const sums = coverageMetricNames
+      .flatMap((metric) => [`SUM(f.${metric}_covered) AS ${metric}_covered`, `SUM(f.${metric}_total) AS ${metric}_total`])
+      .join(", ");
+    return this.connection
+      .prepare(`
+        SELECT sl.*, COUNT(f.file_path) AS measured_files, ${sums},
+          MAX(cs.captured_at || '|' || COALESCE(cs.resolved_sha, '')) AS coverage_source
+        FROM slices sl
+        LEFT JOIN slice_files sf ON sf.slice_id = sl.id
+        LEFT JOIN (coverage_files f JOIN coverage_snapshots cs ON cs.id = f.snapshot_id)
+          ON f.file_path = sf.file_path
+          AND cs.repository_id = sl.repository_id
+          AND substr(f.file_path, 1, length(sl.backend_directory) + 1) = sl.backend_directory || '/'
+        WHERE sl.repository_id = ? ${sliceName ? "AND sl.name = ? COLLATE NOCASE" : ""}
+        GROUP BY sl.id
+        ORDER BY sl.name COLLATE NOCASE ASC
+      `)
+      .all(...(sliceName ? [repositoryId, sliceName] : [repositoryId])) as SliceRow[];
+  }
+
+  listSlices(repositoryId: string): Slice[] {
+    return this.sliceRows(repositoryId).map((row) => this.mapSlice(row));
+  }
+
+  getSlice(repositoryId: string, name: string): SliceDetail | null {
+    const row = this.sliceRows(repositoryId, name)[0];
+    if (!row) return null;
+    return { ...this.mapSlice(row), endpoints: JSON.parse(row.endpoints_json) as SliceEndpoint[] };
+  }
+
+  /** Slice trend points, shaped like app coverage history with the slice name as the app. */
+  listSliceHistory(repositoryId: string): CoverageHistoryEntry[] {
+    const rows = this.connection
+      .prepare(`
+        SELECT * FROM slice_history WHERE repository_id = ?
+        ORDER BY recorded_at ASC, run_id ASC, slice_name COLLATE NOCASE ASC
+      `)
+      .all(repositoryId) as SliceHistoryRow[];
+    return rows.map((row) => ({
+      runId: row.run_id,
+      appName: row.slice_name,
+      requestedRef: row.requested_ref,
+      resolvedSha: row.resolved_sha,
+      useLocalWorkingTree: row.use_local_working_tree === 1,
+      dirty: row.dirty === 1,
+      recordedAt: row.recorded_at,
+      coverage: {
+        lines: percentMetric(row.lines_covered, row.lines_total),
+        statements: percentMetric(row.statements_covered, row.statements_total),
+        functions: percentMetric(row.functions_covered, row.functions_total),
+        branches: percentMetric(row.branches_covered, row.branches_total)
+      },
+      tests: null
+    }));
+  }
+
 }

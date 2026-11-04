@@ -659,3 +659,85 @@ button.trend-legend-item:hover { color: var(--accent); background: var(--surface
 .trend-footer .trend-table { flex: 1 1 320px; min-width: 0; margin-top: 0; }
 .trend-export { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 700; color: var(--muted); }
 .trend-export .text-button { font-size: 12px; padding: 0; }
+
+/* Slices: backend coverage per frontend app */
+.slice-heading-actions { align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.slice-local-toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.slice-build { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 14px 18px; margin-bottom: 18px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); font-size: 13px; color: #5d566d; }
+.slice-build .status-running { color: #a2552c; background: #fdf1e8; border-color: #f6e0cf; }
+.slice-build-log { margin-left: auto; font-size: 12px; font-weight: 700; }
+.slice-build-error, .slice-build-skipped { flex-basis: 100%; margin: 0; font-size: 12px; line-height: 1.6; }
+.slice-build-error { color: var(--danger); }
+.slice-build-skipped { color: var(--warning); }
+.slice-setup { margin-bottom: 26px; }
+.slice-setup > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 25px; cursor: pointer; list-style: none; }
+.slice-setup > summary::-webkit-details-marker { display: none; }
+.slice-setup > summary > span:first-child { display: flex; flex-direction: column; gap: 5px; }
+.slice-setup > summary strong { font-size: 15px; letter-spacing: -.02em; }
+.slice-setup-form { padding: 0 25px 22px; border-top: 1px solid var(--border-soft); }
+.slice-setup-form > p { max-width: 820px; line-height: 1.75; margin: 16px 0 18px; }
+.slice-setup-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 22px; }
+.slice-setup-grid label { display: flex; flex-direction: column; gap: 6px; }
+.slice-setup-grid label > span { font-size: 12px; font-weight: 700; color: #6f6480; }
+.slice-setup-grid input { min-height: 40px; padding: 0 12px; border: 1px solid #dfdce8; border-radius: 8px; background: #fff; color: var(--text); }
+.slice-setup-grid input:focus { outline: 3px solid #e2d9fb; border-color: #b8a6e8; }
+.slice-setup-grid small { font-size: 11px; color: var(--faint); line-height: 1.5; }
+.slice-setup-error { padding: 12px 0 0; }
+.slice-setup-actions { display: flex; justify-content: flex-end; margin-top: 18px; }
+.slice-grid-heading { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin: 6px 0 16px; }
+.slice-grid-heading h2 { margin: 6px 0 6px; font-size: 20px; letter-spacing: -.04em; }
+.slice-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 16px; margin-bottom: 30px; }
+.slice-card { display: flex; flex-direction: column; color: var(--text); transition: border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease; }
+.slice-card:hover { color: var(--text); border-color: #cdbff0; box-shadow: 0 8px 18px -10px #5c3ea040; transform: translateY(-2px); }
+.slice-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 18px 20px 4px; color: var(--faint); }
+.slice-card-heading > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.slice-card-heading strong { font-size: 16px; letter-spacing: -.03em; color: var(--text); }
+.slice-card-heading code { font-size: 11px; }
+.slice-card-body { display: flex; align-items: center; gap: 18px; padding: 10px 20px 16px; }
+.slice-card-stat { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.slice-percent { font-size: 28px; font-weight: 800; letter-spacing: -.05em; line-height: 1; }
+.slice-percent-critical { color: #b2454f; }
+.slice-percent-poor { color: #b0612a; }
+.slice-percent-fair { color: #9a7a1f; }
+.slice-percent-good { color: #2b7d5f; }
+.slice-percent-none { color: var(--faint); }
+.slice-card-facts { display: grid; grid-template-columns: repeat(3, 1fr); margin: auto 0 0; border-top: 1px solid var(--border-soft); }
+.slice-card-facts > div { padding: 12px 20px; }
+.slice-card-facts > div + div { border-left: 1px solid var(--border-soft); }
+.slice-card-facts dt { font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: #8a8295; }
+.slice-card-facts dd { margin: 5px 0 0; font-size: 15px; font-weight: 800; }
+.slice-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 10px; }
+.slice-metric { display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
+.slice-metric > div { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.slice-metric .slice-percent { font-size: 24px; }
+.slice-measured-note { margin: 0 0 24px; line-height: 1.6; }
+.slice-endpoint-filter input { min-height: 36px; width: min(320px, 100%); padding: 0 12px; border: 1px solid #dfdce8; border-radius: 8px; }
+.slice-endpoints td { vertical-align: top; }
+.http-method { display: inline-block; min-width: 54px; text-align: center; padding: 3px 6px; border-radius: 5px; font-family: "DM Mono", monospace; font-size: 11px; font-weight: 500; color: #4d74a3; background: #edf4fd; }
+.http-method-post { color: #338061; background: #edf7f1; }
+.http-method-put, .http-method-patch { color: #8c6d3d; background: #fcf6ea; }
+.http-method-delete { color: #af565f; background: #fff0f2; }
+
+/* The pizza itself */
+.pizza { display: block; }
+.pizza-crust { fill: #e2b36b; stroke: #c9934a; stroke-width: 1.2; }
+.pizza-dough { fill: #f6e7c8; }
+.pizza-sauce { fill: #d9583b; }
+.pizza-cheese { fill: #f7cf61; }
+.pizza-topping { fill: #b8372f; stroke: #9a2b25; stroke-width: .6; }
+.pizza-cut { stroke: #fffaf0; stroke-width: 1.1; opacity: .85; }
+.pizza-none .pizza-dough { fill: #efe9dd; }
+
+@media (max-width: 1020px) {
+  .slice-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .slice-setup-grid { grid-template-columns: 1fr; }
+  .slice-setup > summary { flex-direction: column; align-items: flex-start; }
+  .slice-build-log { margin-left: 0; }
+}
+@media (max-width: 540px) {
+  .slice-metrics { grid-template-columns: 1fr; }
+  .slice-card-body { padding-inline: 16px; }
+  .slice-card-facts > div { padding: 12px 14px; }
+}

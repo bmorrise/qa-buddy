@@ -249,6 +249,7 @@ export function RepositoryDetailPage() {
         </div>
         <div className="heading-actions">
           <Link to={`/repositories/${repository.id}/coverage`} className="button button-secondary"><Icon name="coverage" size={16} />Coverage gaps</Link>
+          <Link to={`/repositories/${repository.id}/slices`} className="button button-secondary"><span aria-hidden="true">🍕</span>Slices</Link>
           <Link to={`/repositories/${repository.id}/edit`} className="button button-secondary"><Icon name="settings" size={16} />Edit configuration</Link>
           <button type="button" className="button button-danger" onClick={deleteRepository}>Delete</button>
         </div>

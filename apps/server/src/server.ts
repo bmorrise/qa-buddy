@@ -10,6 +10,8 @@ import {
   coverageFileQuerySchema,
   repositoryInputSchema,
   runRequestSchema,
+  sliceBuildRequestSchema,
+  sliceConfigSchema,
   terminalRunStatuses
 } from "@qa-buddy/shared";
 import { initialLogOffset, readLogChunk } from "./log-stream.js";
@@ -91,6 +93,7 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
   app.delete<{ Params: { repositoryId: string } }>(
     "/api/repositories/:repositoryId",
     async (request, reply) => {
+      const sliceBuildIds = database.listSliceBuilds(request.params.repositoryId, 1_000).map((build) => build.id);
       const result = database.deleteRepository(request.params.repositoryId);
       if (result.active) {
         return reply.code(409).send({ error: "Wait for the active run to finish before deleting this repository" });
@@ -98,6 +101,9 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
       if (!result.deleted) return reply.code(404).send({ error: "Repository not found" });
       for (const runId of result.runIds) {
         rmSync(logPath(options.dataDirectory, runId), { force: true });
+      }
+      for (const buildId of sliceBuildIds) {
+        rmSync(logPath(options.dataDirectory, `slice-build-${buildId}`), { force: true });
       }
       return reply.code(204).send();
     }
@@ -250,6 +256,7 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
     Params: { repositoryId: string };
     Querystring: {
       app?: string;
+      slice?: string;
       metric?: string;
       maxPercent?: string;
       search?: string;
@@ -266,12 +273,106 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
     }
     return database.queryCoverageFiles(request.params.repositoryId, {
       appName: parsed.data.app,
+      sliceName: parsed.data.slice,
       metric: parsed.data.metric,
       maxPercent: parsed.data.maxPercent,
       search: parsed.data.search,
       limit: parsed.data.limit,
       offset: parsed.data.offset
     });
+  });
+
+
+  // ----- Slices --------------------------------------------------------------------
+
+  app.get<{ Params: { repositoryId: string } }>("/api/repositories/:repositoryId/slices", async (request, reply) => {
+    const { repositoryId } = request.params;
+    if (!database.getRepository(repositoryId)) {
+      return reply.code(404).send({ error: "Repository not found" });
+    }
+    return {
+      config: database.getSliceConfig(repositoryId),
+      builds: database.listSliceBuilds(repositoryId),
+      slices: database.listSlices(repositoryId)
+    };
+  });
+
+  app.put<{ Params: { repositoryId: string } }>(
+    "/api/repositories/:repositoryId/slices/config",
+    async (request, reply) => {
+      if (!database.getRepository(request.params.repositoryId)) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const parsed = sliceConfigSchema.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({ error: issueMessage(parsed.error) });
+      }
+      return { config: database.setSliceConfig(request.params.repositoryId, parsed.data) };
+    }
+  );
+
+  app.post<{ Params: { repositoryId: string } }>(
+    "/api/repositories/:repositoryId/slices/builds",
+    async (request, reply) => {
+      const repository = database.getRepository(request.params.repositoryId);
+      if (!repository) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const parsed = sliceBuildRequestSchema.safeParse(request.body ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({ error: issueMessage(parsed.error) });
+      }
+      if (!database.getSliceConfig(repository.id)) {
+        return reply.code(400).send({ error: "Set up slices for this repository before building them" });
+      }
+      if (parsed.data.useLocalWorkingTree && !repository.localPath) {
+        return reply.code(400).send({
+          error: "Add a local checkout path to this repository before building from the local working tree"
+        });
+      }
+      try {
+        const build = database.createSliceBuild(repository.id, parsed.data.ref, parsed.data.useLocalWorkingTree);
+        return reply.code(202).send({ build });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("already has")) {
+          return reply.code(409).send({ error: error.message });
+        }
+        throw error;
+      }
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string } }>(
+    "/api/repositories/:repositoryId/slices/history",
+    async (request, reply) => {
+      if (!database.getRepository(request.params.repositoryId)) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      return { entries: database.listSliceHistory(request.params.repositoryId) };
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string; sliceName: string } }>(
+    "/api/repositories/:repositoryId/slices/:sliceName",
+    async (request, reply) => {
+      if (!database.getRepository(request.params.repositoryId)) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const slice = database.getSlice(request.params.repositoryId, request.params.sliceName);
+      if (!slice) {
+        return reply.code(404).send({ error: "Slice not found" });
+      }
+      return { slice };
+    }
+  );
+
+  app.get<{ Params: { buildId: string } }>("/api/slice-builds/:buildId/log", async (request, reply) => {
+    if (!database.getSliceBuild(request.params.buildId)) {
+      return reply.code(404).send({ error: "Slice build not found" });
+    }
+    const file = logPath(options.dataDirectory, `slice-build-${request.params.buildId}`);
+    if (!existsSync(file)) return reply.type("text/plain").send("");
+    return reply.type("text/plain").send(createReadStream(file));
   });
 
   app.get<{ Params: { repositoryId: string } }>(

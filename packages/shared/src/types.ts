@@ -142,6 +142,8 @@ export interface CoverageHistoryEntry {
 
 export interface CoverageFileQuery {
   appName?: string;
+  /** Only files in this slice. */
+  sliceName?: string;
   metric?: CoverageMetricName;
   maxPercent?: number;
   search?: string;
@@ -305,3 +307,86 @@ export const terminalRunStatuses: RunStatus[] = [
   "timed_out",
   "interrupted"
 ];
+
+// ----- Slices: backend coverage per frontend app -------------------------------
+
+/**
+ * How a repository's slices are derived. A slice is every backend file a
+ * frontend app depends on, traced from the generated-client calls it makes.
+ */
+export interface SliceConfig {
+  /** NestJS backend workspace, for example `apps/idp-api-service`. */
+  backendDirectory: string;
+  /** Generated API client package the frontends call through. */
+  clientPackage: string;
+  /** Root module relative to the backend workspace, normally `src/app.module.ts`. */
+  rootModule: string;
+  /**
+   * Frontend workspaces to slice. Empty means every `apps/*` workspace that
+   * depends on the client package.
+   */
+  frontendDirectories: string[];
+}
+
+export type SliceBuildStatus = "queued" | "running" | "passed" | "failed";
+
+export interface SliceBuild {
+  id: string;
+  repositoryId: string;
+  status: SliceBuildStatus;
+  requestedRef: string;
+  useLocalWorkingTree: boolean;
+  resolvedSha: string | null;
+  dirty: boolean;
+  error: string | null;
+  /** Number of slices written; null until the build finishes. */
+  sliceCount: number | null;
+  /** Frontends that could not be sliced, with the reason. */
+  skipped: Array<{ frontendDirectory: string; reason: string }>;
+  config: SliceConfig;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface SliceEndpoint {
+  httpMethod: string;
+  path: string;
+  controller: string;
+  methodKey: string;
+  /** Repository-relative controller file. */
+  file: string;
+  /** Generated client exports the frontend used to call it. */
+  clientNames: string[];
+}
+
+export interface Slice {
+  name: string;
+  frontendDirectory: string;
+  backendDirectory: string;
+  buildId: string;
+  /** Commit the slice was traced from. */
+  resolvedSha: string | null;
+  builtAt: string;
+  endpointCount: number;
+  fileCount: number;
+  /** Slice files that appear in the current coverage snapshot. */
+  measuredFileCount: number;
+  /** Current coverage of the slice, from the latest coverage snapshot. */
+  coverage: CoverageSummary;
+  /** Capture time and commit of the snapshot the coverage came from. */
+  coverageCapturedAt: string | null;
+  coverageSha: string | null;
+}
+
+export interface SliceDetail extends Slice {
+  endpoints: SliceEndpoint[];
+}
+
+export interface SliceOverview {
+  config: SliceConfig | null;
+  builds: SliceBuild[];
+  slices: Slice[];
+}
+
+export const activeSliceBuildStatuses: SliceBuildStatus[] = ["queued", "running"];

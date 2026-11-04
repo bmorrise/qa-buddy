@@ -4,9 +4,10 @@ import type {
   CoverageMetric,
   CoverageMetricName,
   CoverageSnapshot,
-  RepositoryDetail
+  RepositoryDetail,
+  SliceOverview
 } from "@qa-buddy/shared";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { Icon } from "../components/Icon";
 import { Loading } from "../components/Loading";
@@ -49,6 +50,9 @@ export function CoverageGapsPage() {
   const [snapshots, setSnapshots] = useState<CoverageSnapshot[] | null>(null);
   const [page, setPage] = useState<CoverageFilePage | null>(null);
   const [error, setError] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [sliceNames, setSliceNames] = useState<string[]>([]);
+  const sliceName = searchParams.get("slice") ?? "";
   const [appName, setAppName] = useState("");
   const [metric, setMetric] = useState<CoverageMetricName>("branches");
   const [maxPercent, setMaxPercent] = useState<number | undefined>(undefined);
@@ -66,6 +70,10 @@ export function CoverageGapsPage() {
         setSnapshots(snapshotResponse.snapshots);
       })
       .catch((caught: Error) => setError(caught.message));
+    // Slices are optional, so a failure here never blocks the page.
+    api<SliceOverview>(`/api/repositories/${repositoryId}/slices`)
+      .then((overview) => setSliceNames(overview.slices.map((slice) => slice.name)))
+      .catch(() => setSliceNames([]));
   }, [repositoryId]);
 
   useEffect(() => {
@@ -76,6 +84,7 @@ export function CoverageGapsPage() {
       offset: String(offset)
     });
     if (appName) parameters.set("app", appName);
+    if (sliceName) parameters.set("slice", sliceName);
     if (maxPercent !== undefined) parameters.set("maxPercent", String(maxPercent));
     if (search.trim()) parameters.set("search", search.trim());
 
@@ -84,7 +93,7 @@ export function CoverageGapsPage() {
       .then(setPage)
       .catch((caught: Error) => setError(caught.message))
       .finally(() => setLoadingFiles(false));
-  }, [repositoryId, snapshots, appName, metric, maxPercent, search, offset]);
+  }, [repositoryId, snapshots, appName, sliceName, metric, maxPercent, search, offset]);
 
   const stalest = useMemo(() => {
     if (!snapshots || snapshots.length === 0) return null;
@@ -172,6 +181,26 @@ export function CoverageGapsPage() {
                   ))}
                 </select>
               </label>
+              {(sliceNames.length > 0 || sliceName) && (
+                <label>
+                  <span>Slice</span>
+                  <select
+                    value={sliceName}
+                    onChange={(event) => {
+                      setOffset(0);
+                      const next = new URLSearchParams(searchParams);
+                      if (event.target.value) next.set("slice", event.target.value);
+                      else next.delete("slice");
+                      setSearchParams(next, { replace: true });
+                    }}
+                  >
+                    <option value="">Any slice</option>
+                    {Array.from(new Set([...sliceNames, ...(sliceName ? [sliceName] : [])])).map((name) => (
+                      <option key={name} value={name}>{name}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <label>
                 <span>Rank by</span>
                 <select

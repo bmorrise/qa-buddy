@@ -22,6 +22,7 @@ import {
 } from "./git.js";
 import { RunLogger } from "./logger.js";
 import { ProcessError } from "./process.js";
+import { executeSliceBuild } from "./slices/build.js";
 import { readTestResults } from "./test-results.js";
 import {
   APP_TIME_LIMIT_HISTORY,
@@ -95,6 +96,8 @@ export class QaBuddyWorker {
     if (cleaned || interrupted.length) {
       console.info(`Recovered ${cleaned} runner container(s) and ${interrupted.length} interrupted run(s)`);
     }
+    const failedBuilds = this.options.database.markActiveSliceBuildsFailed();
+    if (failedBuilds.length) console.info(`Failed ${failedBuilds.length} slice build(s) interrupted by a restart`);
   }
 
   async run(): Promise<void> {
@@ -103,9 +106,15 @@ export class QaBuddyWorker {
       const run = this.options.database.claimNextRun();
       if (run) {
         await this.executeRun(run);
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, this.options.pollIntervalMs ?? 1_000));
+        continue;
       }
+      // Test runs take priority; slice builds only read source and finish quickly.
+      const sliceBuild = this.options.database.claimNextSliceBuild();
+      if (sliceBuild) {
+        await executeSliceBuild(sliceBuild, this.options);
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.options.pollIntervalMs ?? 1_000));
     }
   }
 
@@ -208,6 +217,36 @@ export class QaBuddyWorker {
       logger.line(
         `Unable to update the ${appRun.name} coverage snapshot: ${error instanceof Error ? error.message : "unknown error"}`
       );
+    }
+  }
+
+  /**
+   * Adds this run's point to every slice measured against the app that just
+   * finished. Unlike the snapshot, local working tree runs are recorded and
+   * flagged, matching app coverage history.
+   */
+  private recordSliceHistory(
+    run: RunDetail,
+    appRun: AppRun,
+    logger: RunLogger,
+    source: { resolvedSha: string; dirty: boolean },
+    coverageFiles: CoverageFileEntry[]
+  ): void {
+    if (coverageFiles.length === 0) return;
+    try {
+      const written = this.options.database.recordSliceHistory({
+        repositoryId: run.repositoryId,
+        runId: run.id,
+        requestedRef: run.requestedRef,
+        resolvedSha: source.resolvedSha,
+        useLocalWorkingTree: run.useLocalWorkingTree,
+        dirty: source.dirty,
+        workingDirectory: appRun.workingDirectory,
+        files: coverageFiles
+      });
+      if (written) logger.line(`Recorded ${appRun.name} coverage for ${written} slice${written === 1 ? "" : "s"}`);
+    } catch (error) {
+      logger.line(`Unable to record slice coverage: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   }
 
@@ -481,6 +520,7 @@ export class QaBuddyWorker {
           coverageFormat,
           coveragePath
         });
+        this.recordSliceHistory(run, appRun, logger, source, coverageFiles);
         this.options.database.finishAppRun(appRun.id, {
           status: passed ? "passed" : "failed",
           exitCode,
