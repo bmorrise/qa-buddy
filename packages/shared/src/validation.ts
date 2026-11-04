@@ -100,6 +100,18 @@ export const repositoryInputSchema = z
       )
       .max(50)
       .default([]),
+    excludedWorkspaces: z
+      .array(
+        z
+          .string()
+          .trim()
+          .refine(
+            (value) => isSafeRelativePath(value),
+            "Workspace directory must be a relative path inside the repository"
+          )
+      )
+      .max(50)
+      .default([]),
     runnerImage: z
       .string()
       .trim()
@@ -152,6 +164,32 @@ export const repositoryInputSchema = z
         code: z.ZodIssueCode.custom,
         path: ["additionalWorkspaces"],
         message: "Additional workspaces apply to auto-detection; enable it or configure these apps manually"
+      });
+    }
+
+    if (new Set(value.excludedWorkspaces).size !== value.excludedWorkspaces.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["excludedWorkspaces"],
+        message: "Excluded workspaces must be unique"
+      });
+    }
+
+    if (value.excludedWorkspaces.length > 0 && !value.autoDetect) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["excludedWorkspaces"],
+        message: "Excluded workspaces apply to auto-detection; remove the app from the configured list instead"
+      });
+    }
+
+    const excluded = new Set(value.excludedWorkspaces);
+    const conflicting = value.additionalWorkspaces.filter((workspace) => excluded.has(workspace));
+    if (conflicting.length > 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["excludedWorkspaces"],
+        message: `Workspaces cannot be both additional and excluded: ${conflicting.join(", ")}`
       });
     }
 

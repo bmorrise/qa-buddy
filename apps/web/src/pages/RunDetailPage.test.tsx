@@ -56,6 +56,7 @@ function runFixture(status: RunStatus = "passed", selectedApps: string[] | null 
       testWorkerLimit: 2,
       timeoutMinutes: 30,
       additionalWorkspaces: [],
+      excludedWorkspaces: [],
       environmentAllowlist: [],
       autoDetect: true,
       apps: [],

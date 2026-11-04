@@ -350,4 +350,57 @@ describe("pnpm and Turborepo detection", () => {
       ]);
     });
   });
+
+  describe("excluded workspaces", () => {
+    function platformLayout(): void {
+      writeFileSync(path.join(directory, "pnpm-workspace.yaml"), "packages:\n  - 'apps/*'\n", "utf8");
+      writeJson(path.join(directory, "apps/idcloud/package.json"), {
+        name: "idcloud",
+        scripts: { "test:coverage": "vitest run --coverage" }
+      });
+      // Mirrors idplans-platform: a vitest script with no test files behind it.
+      writeJson(path.join(directory, "apps/user-crm-sync/package.json"), {
+        name: "@idplans-platform/user-crm-sync",
+        scripts: { "test:coverage": "vitest run --coverage --passWithNoTests" }
+      });
+    }
+
+    it("skips an excluded workspace that would otherwise be detected", async () => {
+      platformLayout();
+      const result = await detectPnpmWorkspaceApps(directory, 2, [], ["apps/user-crm-sync"]);
+      expect(result.apps.map((app) => app.workingDirectory)).toEqual(["apps/idcloud"]);
+      expect(result.excluded).toEqual(["apps/user-crm-sync"]);
+      expect(result.unmatchedExclusions).toEqual([]);
+    });
+
+    it("tolerates a trailing slash and duplicate entries", async () => {
+      platformLayout();
+      const result = await detectPnpmWorkspaceApps(directory, 2, [], ["apps/user-crm-sync/", "apps/user-crm-sync"]);
+      expect(result.apps.map((app) => app.workingDirectory)).toEqual(["apps/idcloud"]);
+      expect(result.excluded).toEqual(["apps/user-crm-sync"]);
+    });
+
+    it("reports an exclusion that matches no workspace without failing", async () => {
+      platformLayout();
+      const result = await detectPnpmWorkspaceApps(directory, 2, [], ["apps/idvision-e2e"]);
+      expect(result.apps.map((app) => app.workingDirectory)).toEqual(["apps/idcloud", "apps/user-crm-sync"]);
+      expect(result.excluded).toEqual([]);
+      expect(result.unmatchedExclusions).toEqual(["apps/idvision-e2e"]);
+    });
+
+    it("can exclude a workspace from the no-apps fallback", async () => {
+      writeFileSync(path.join(directory, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n", "utf8");
+      writeJson(path.join(directory, "packages/core/package.json"), { name: "core", scripts: { test: "vitest run" } });
+      writeJson(path.join(directory, "packages/legacy/package.json"), { name: "legacy", scripts: { test: "vitest run" } });
+      const result = await detectPnpmWorkspaceApps(directory, 2, [], ["packages/legacy"]);
+      expect(result.apps.map((app) => app.workingDirectory)).toEqual(["packages/core"]);
+    });
+
+    it("names the exclusions when nothing testable remains", async () => {
+      platformLayout();
+      await expect(
+        detectPnpmWorkspaceApps(directory, 2, [], ["apps/idcloud", "apps/user-crm-sync"])
+      ).rejects.toThrow(/No coverage-capable test scripts.*excluded: apps\/idcloud, apps\/user-crm-sync/);
+    });
+  });
 });

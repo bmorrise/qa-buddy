@@ -263,6 +263,10 @@ const migrations = [
   {
     version: 15,
     sql: "ALTER TABLE repositories ADD COLUMN coverage_goal REAL;"
+  },
+  {
+    version: 16,
+    sql: "ALTER TABLE repositories ADD COLUMN excluded_workspaces_json TEXT NOT NULL DEFAULT '[]';"
   }
 ] as const;
 
@@ -273,6 +277,7 @@ interface RepositoryRow {
   default_ref: string;
   local_path: string | null;
   additional_workspaces_json: string;
+  excluded_workspaces_json: string;
   runner_image: string;
   setup_command: string | null;
   build_command: string | null;
@@ -478,6 +483,7 @@ export class QaBuddyDatabase {
     const configurationSnapshot: RunConfigurationSnapshot = {
       ...storedSnapshot,
       testWorkerLimit: storedSnapshot.testWorkerLimit ?? 2,
+      excludedWorkspaces: storedSnapshot.excludedWorkspaces ?? [],
       selectedApps: storedSnapshot.selectedApps ?? null
     };
     const base: RunSummary = {
@@ -535,6 +541,7 @@ export class QaBuddyDatabase {
       defaultRef: row.default_ref,
       localPath: row.local_path ?? undefined,
       additionalWorkspaces: JSON.parse(row.additional_workspaces_json) as string[],
+      excludedWorkspaces: JSON.parse(row.excluded_workspaces_json) as string[],
       runnerImage: row.runner_image,
       setupCommand: row.setup_command ?? undefined,
       buildCommand: row.build_command ?? undefined,
@@ -558,6 +565,7 @@ export class QaBuddyDatabase {
       defaultRef: repository.defaultRef,
       localPath: repository.localPath,
       additionalWorkspaces: repository.additionalWorkspaces,
+      excludedWorkspaces: repository.excludedWorkspaces,
       runnerImage: repository.runnerImage,
       setupCommand: repository.setupCommand,
       buildCommand: repository.buildCommand,
@@ -587,8 +595,11 @@ export class QaBuddyDatabase {
   getRepositoryDetail(id: string, runLimit = 20): RepositoryDetail | null {
     const repository = this.getRepository(id);
     if (!repository) return null;
+    // Apply current exclusions to the last detection so a newly excluded app
+    // stops being selectable before the next run confirms it.
+    const excluded = new Set(repository.excludedWorkspaces);
     const selectableApps = repository.autoDetect
-      ? this.latestDetectedApps(id)
+      ? this.latestDetectedApps(id).filter((app) => !excluded.has(app.workingDirectory))
       : this.repositoryInput(repository).apps;
     return {
       ...repository,
@@ -616,10 +627,10 @@ export class QaBuddyDatabase {
       this.connection
         .prepare(`
           INSERT INTO repositories(
-            id, name, github_url, default_ref, local_path, additional_workspaces_json, runner_image, setup_command,
-            build_command, test_worker_limit, timeout_minutes, environment_allowlist_json, auto_detect, coverage_goal,
-            created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, name, github_url, default_ref, local_path, additional_workspaces_json, excluded_workspaces_json,
+            runner_image, setup_command, build_command, test_worker_limit, timeout_minutes, environment_allowlist_json,
+            auto_detect, coverage_goal, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           id,
@@ -628,6 +639,7 @@ export class QaBuddyDatabase {
           input.defaultRef,
           input.localPath || null,
           JSON.stringify(input.additionalWorkspaces ?? []),
+          JSON.stringify(input.excludedWorkspaces ?? []),
           input.runnerImage,
           input.setupCommand || null,
           input.buildCommand || null,
@@ -651,7 +663,8 @@ export class QaBuddyDatabase {
       this.connection
         .prepare(`
           UPDATE repositories SET
-            name = ?, github_url = ?, default_ref = ?, local_path = ?, additional_workspaces_json = ?, runner_image = ?, setup_command = ?,
+            name = ?, github_url = ?, default_ref = ?, local_path = ?, additional_workspaces_json = ?,
+            excluded_workspaces_json = ?, runner_image = ?, setup_command = ?,
             build_command = ?, test_worker_limit = ?, timeout_minutes = ?, environment_allowlist_json = ?, auto_detect = ?,
             coverage_goal = ?, updated_at = ?
           WHERE id = ?
@@ -662,6 +675,7 @@ export class QaBuddyDatabase {
           input.defaultRef,
           input.localPath || null,
           JSON.stringify(input.additionalWorkspaces ?? []),
+          JSON.stringify(input.excludedWorkspaces ?? []),
           input.runnerImage,
           input.setupCommand || null,
           input.buildCommand || null,
@@ -1134,6 +1148,34 @@ export class QaBuddyDatabase {
     this.connection
       .prepare("UPDATE app_runs SET status = 'running', started_at = ? WHERE id = ?")
       .run(now(), id);
+  }
+
+  /**
+   * Durations in milliseconds of each app's most recent passing runs in this
+   * repository, newest first, keyed by app name.
+   */
+  recentPassingAppDurations(repositoryId: string, perApp: number): Map<string, number[]> {
+    const rows = this.connection
+      .prepare(`
+        SELECT name, started_at, finished_at FROM (
+          SELECT a.name, a.started_at, a.finished_at,
+            ROW_NUMBER() OVER (PARTITION BY a.name ORDER BY a.finished_at DESC) AS recency
+          FROM app_runs a
+          JOIN runs r ON r.id = a.run_id
+          WHERE r.repository_id = ? AND a.status = 'passed'
+            AND a.started_at IS NOT NULL AND a.finished_at IS NOT NULL
+        )
+        WHERE recency <= ?
+        ORDER BY name, recency
+      `)
+      .all(repositoryId, perApp) as Array<{ name: string; started_at: string; finished_at: string }>;
+    const durations = new Map<string, number[]>();
+    for (const row of rows) {
+      const duration = Date.parse(row.finished_at) - Date.parse(row.started_at);
+      if (!Number.isFinite(duration) || duration < 0) continue;
+      durations.set(row.name, [...(durations.get(row.name) ?? []), duration]);
+    }
+    return durations;
   }
 
   setDetectedApps(runId: string, apps: RepositoryInput["apps"]): RunDetail {

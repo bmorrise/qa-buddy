@@ -41,6 +41,11 @@ export interface RepositoryInput {
    * auto-detection is on, for example `libs/scout-ui`. Opt-in only.
    */
   additionalWorkspaces: string[];
+  /**
+   * Workspace directories auto-detection never tests, even when they have a
+   * test script, for example `apps/user-crm-sync`.
+   */
+  excludedWorkspaces: string[];
   runnerImage: string;
   setupCommand?: string;
   buildCommand?: string;
@@ -230,6 +235,11 @@ export interface Repository {
    * auto-detection is on, for example `libs/scout-ui`. Opt-in only.
    */
   additionalWorkspaces: string[];
+  /**
+   * Workspace directories auto-detection never tests, even when they have a
+   * test script, for example `apps/user-crm-sync`.
+   */
+  excludedWorkspaces: string[];
   runnerImage: string;
   setupCommand?: string;
   buildCommand?: string;
