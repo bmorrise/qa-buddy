@@ -54,7 +54,7 @@ Enable **Auto-detect pnpm/Turborepo apps** when the repository has a root `pnpm-
 2. Prioritizes workspaces under `apps/`; if there is no `apps/` group, it considers all workspaces.
 3. Reads each workspace `package.json` and selects `test:coverage`, then `test:cov`, `coverage`, and finally `test` in that order.
 4. Runs the selected script from that app's workspace directory.
-5. Adds Jest or Vitest's JSON test reporter, requires an Istanbul-compatible JSON coverage summary for both runners, and records exact passed, failed, skipped, and todo test cases.
+5. Adds Jest or Vitest's JSON test reporter, requires an Istanbul-compatible JSON coverage summary for both runners, also asks for Istanbul's detailed `coverage-final.json` report (the source of per-file gap locations), and records exact passed, failed, skipped, and todo test cases.
 6. Limits parallel Jest and Vitest workers to the configured per-app value, preserves serial Jest scripts, uses version-compatible Vitest worker flags, and ignores compiled `dist` output during Jest coverage collection.
 7. Clears that app's old structured-test and coverage files before execution, then discovers newly generated `coverage/coverage-summary.json` or `coverage/lcov.info`, including repository-root `coverage/apps/...` layouts and both JSON/LCOV files in safe shared Jest `coverageDirectory` values from package.json. This prevents a failed app from inheriting another app's shared or stale report.
 
@@ -193,57 +193,129 @@ The view ranks by branch coverage by default, because branches are where unteste
 
 Istanbul summary reports provide lines, statements, functions, and branches per file. LCOV provides lines, functions, and branches; statements are `N/A` because LCOV does not define a separate statement metric.
 
+Select **Show gaps** on any file row to see where its gaps are: functions never called (with their line), line ranges that never ran, and branch points where some paths were never taken. Gap details come from Istanbul's detailed report (`coverage-final.json`, requested automatically for auto-detected Jest and Vitest apps; for manually configured apps, add the `json` coverage reporter next to `json-summary`) or from LCOV. Snapshots captured before this was added show none until the app's next run.
+
 Coverage percentage identifies lines that never executed, not behaviour that was never considered. A file at 100% line coverage with weak assertions still looks complete here. Treat zero-coverage files and low branch coverage as leads to investigate rather than a finished verdict.
 
-When a repository has slices, a **Slice** filter narrows the list to one slice's backend files. Slice pages link here with the filter already applied.
+When a repository has slices, a **Slice** filter narrows the list to one slice's backend files. Slice pages link here with the filter already applied. **CSV** and **JSON** links download every file matching the current filters; see [Exporting files](#exporting-files).
 
 ## Slices: backend coverage by app
 
-A monorepo backend usually serves several frontends, so its overall coverage cannot tell you how well-tested any one app's backend is. A **slice** is the share of the backend that one frontend depends on, and QA Buddy measures and trends each one. Open **Slices** from the repository page.
+A monorepo backend usually serves several frontends, so its overall coverage cannot tell you how well-tested any one app's backend is. A **slice** is the share of the backends that one frontend depends on, and QA Buddy measures and trends each one. Open **Slices** from the repository page.
 
 Ownership is derived from the code, never maintained by hand:
 
-1. **Frontend trace.** Starting from the app's entry point (the module script in `index.html`, otherwise `src/main` or `src/index`), QA Buddy follows runtime imports, including lazy `import()` routes, tsconfig path aliases, the Vite `@/` alias, and pnpm workspace libraries the app imports. It collects every function the app imports from the generated API client. Type-only imports, tests, stories, mocks, and Cypress files are ignored, and code the entry point no longer reaches drops out automatically.
-2. **Endpoint match.** It parses the backend's NestJS controllers and reproduces the operation ids the OpenAPI document publishes: the method name or an explicit `@ApiOperation({ operationId })`, with path or verb suffixes for duplicates, in the scanner's module registration order from the root module. Each client export (`useGetInspection`, `getGetInspectionQueryKey`, `getInspection`, and so on) then maps to exactly one endpoint.
-3. **Backend closure.** From each matched controller it follows runtime imports inside the backend workspace. The result is the slice's file list.
+1. **Frontend trace.** Starting from the app's entry point (the module script in `index.html`, otherwise `src/main` or `src/index`), QA Buddy follows runtime imports, including lazy `import()` routes, tsconfig path aliases, the Vite `@/` alias, and pnpm workspace libraries the app imports. Type-only imports, tests, stories, mocks, and Cypress files are ignored, and code the entry point no longer reaches drops out automatically.
+2. **Request match.** Every request the traced code makes to a configured backend is matched to a route, in two ways:
+   - **Generated client calls.** Functions imported from an orval client (`useGetInspection`, `getGetInspectionQueryKey`, `getInspection`, and so on) map to NestJS endpoints by reproducing the operation ids the OpenAPI document publishes: the method name or an explicit `@ApiOperation({ operationId })`, with path or verb suffixes for duplicates, in the scanner's module registration order from the root module.
+   - **Hand-written requests.** `fetch`, `axios`, and similar calls whose URL is built from a backend's base URL name (`` `${import.meta.env.VITE_API_HOST}/users/${id}` ``, `HOST + '/login'`, a local `const base = ...`, a URL held in a variable, or an `axios.create({ baseURL })` client) are matched to routes by path and verb. Interpolated values only fill route parameters, and the most specific route wins.
+3. **Backend closure.** From each matched handler it follows runtime imports inside that backend's workspace, including modules a file loads from its own directory at runtime (such as a Sequelize `models/index.js`). Express route indexes that mount every sibling file are treated as routing, not as dependencies, so one shared route file does not pull every route into a slice.
+
+A slice can span several backends. Its totals add the backends together, and the slice page breaks them down per backend.
 
 Slices overlap by design. Shared modules such as auth, data entities, and common utilities belong to every slice that reaches them, because a change there can break any of those apps. For the same reason the slice trend has no "All" tab: a total across slices would count shared files more than once.
 
-Nothing is installed or built. The analysis reads source from a fresh checkout, so a rebuild takes seconds plus clone time, and the generated client and OpenAPI files do not need to exist.
+Nothing is installed or built. The analysis reads source from a fresh checkout, so a rebuild takes seconds plus clone time, and generated client and OpenAPI files do not need to exist.
 
 ### Set up slices for a repository
 
-Slices currently support a **NestJS backend** called through an **orval-generated react-query client** that the frontends import as a pnpm workspace package. On the Slices page, open **Slice setup** and fill in the recipe:
+On the Slices page, open **Slice setup** and add one entry per backend:
 
-| Field | Example | Notes |
-|---|---|---|
-| Backend workspace | `apps/idp-api-service` | The NestJS app whose coverage the slices measure. It must also be a tested app in QA Buddy so its per-file coverage exists. |
-| Generated client package | `@idplans-platform/api-client` | The `package.json` name the frontends import endpoint calls from. |
-| Root module | `src/app.module.ts` | Relative to the backend workspace. Used to reproduce operation ids exactly. |
-| Frontends | `apps/idinspect, apps/idcloud` | Optional. Leave blank to slice every `apps/*` workspace whose `package.json` depends on the client package. Each slice is named after its directory. |
+| Field | Applies to | Example | Notes |
+|---|---|---|---|
+| Workspace | All | `apps/idp-api-service` | The backend whose coverage the slices measure. It must also be a tested app in QA Buddy so its per-file coverage exists. |
+| Framework | All | NestJS or Express | How routes are discovered: NestJS controllers, or Express `app.use`/`router.get` mounts. |
+| Generated client package | NestJS | `@idplans-platform/api-client` | Optional. The `package.json` name frontends import endpoint calls from. |
+| Root module | NestJS | `src/app.module.ts` | Relative to the workspace. Used to reproduce operation ids exactly. |
+| Entry file | Express | `app.js` | The file that creates the app and mounts its routers. |
+| Base URL names | All | `VITE_AUTH_API_HOST, apiHost` | Variables, env keys, or props frontends build this backend's URLs from. Required for Express; add them to a NestJS backend too when some calls bypass the generated client. |
 
-Then select **Bake slices**. The build runs on the worker between test runs, checks out the repository's default ref (or the local working tree when that box is ticked), and stores one slice per frontend. A frontend that cannot be traced, for example one with no entry point, is skipped with the reason shown next to the build status, and the rest are still stored. A failed build keeps the previous slices.
+Then list the **Frontends** to slice, for example `apps/idinspect, apps/idcloud`, or leave it blank to slice every `apps/*` workspace whose `package.json` depends on one of the generated client packages. Each slice is named after its directory.
+
+To find base URL names, search a frontend for its API hosts (for example `grep -rn "import.meta.env.VITE_.*HOST" apps/<frontend>/src`) and check the frontend's `.env` files to see which backend each one points at. Shared libraries often take the host as a prop such as `apiHost`; list the prop name too.
+
+Select **Bake slices**. The build runs on the worker between test runs, checks out the repository's default ref (or the local working tree when that box is ticked), and stores one slice per frontend. A frontend that cannot be traced, for example one with no entry point, is skipped with the reason shown next to the build status, and the rest are still stored. A failed build keeps the previous slices.
 
 The recipe and slices live in QA Buddy's SQLite database, not in the repository being measured, so nothing QA Buddy-specific is committed there. On a new machine or a fresh data volume, re-enter the recipe and bake again. The same recipe can also be saved through the API:
 
 ```bash
 curl -X PUT http://localhost:3003/api/repositories/<repository-id>/slices/config \
   -H 'content-type: application/json' \
-  -d '{"backendDirectory":"apps/idp-api-service","clientPackage":"@idplans-platform/api-client","frontendDirectories":["apps/idinspect"]}'
+  -d '{
+    "backends": [
+      { "directory": "apps/idp-api-service", "framework": "nestjs",
+        "clientPackage": "@idplans-platform/api-client", "baseUrlNames": ["VITE_AUTH_API_V2_HOST"] },
+      { "directory": "apps/rpm-api", "framework": "express",
+        "entryFile": "app.js", "baseUrlNames": ["VITE_AUTH_API_HOST", "apiHost"] }
+    ],
+    "frontendDirectories": ["apps/idinspect", "apps/idcloud"]
+  }'
 curl -X POST http://localhost:3003/api/repositories/<repository-id>/slices/builds -H 'content-type: application/json' -d '{}'
 ```
 
 ### When to rebake
 
-Coverage updates on its own: slice percentages are always calculated from the latest backend coverage snapshot, and every run that tests the backend adds a point to each slice's trend. Rebaking is only needed when **which files belong to a slice** may have changed, such as a frontend calling new endpoints, a new backend module, or a refactor that moves code. Rebaking every week or two, or after a large feature lands, is plenty. Each new bake also seeds a trend point from the current snapshot, so a fresh slice has a starting value immediately.
+Coverage updates on its own: slice percentages are always calculated from the latest backend coverage snapshots, and every run that tests one of a slice's backends adds a point to its trend. When a run tests only some of a slice's backends, the others contribute their latest snapshot, so the total never drops a backend just because it did not run.
+
+Rebaking is only needed when **which files belong to a slice** may have changed, such as a frontend calling new endpoints, a new backend module, or a refactor that moves code. Rebaking every week or two, or after a large feature lands, is plenty. Each new bake also seeds a trend point from the current snapshot, so a fresh slice has a starting value immediately.
 
 ### Reading a slice
 
-- **Measured** counts slice files that appear in the latest coverage report. Files with no executable code, such as type-only modules and email templates the backend does not collect coverage for, are not reported and do not affect the percentages.
-- Precision is per file. If a frontend calls one endpoint on a controller, the whole controller file and everything it imports count toward that slice.
-- A slice detail page lists the weakest files first and every endpoint the frontend calls, with the client hooks it calls them through. Use it to point test work where the app is most exposed.
+- **Measured** counts slice files that appear in the latest coverage reports. Files with no executable code, such as type-only modules and email templates the backend does not collect coverage for, are not reported and do not affect the percentages.
+- Precision is per file. If a frontend calls one endpoint in a controller or route file, the whole file and everything it imports count toward that slice.
+- The slice page lists the weakest files first, a per-backend breakdown, and every endpoint the frontend calls with the client hook or `file:line` request that reaches it.
+- **Requests that matched no route** are listed separately. They usually mean a removed route, a path assembled at runtime, or a backend missing from the recipe; their backend code is not in the slice until they match.
 
-Not yet supported: hand-written `fetch`/`axios` calls that bypass the generated client, non-NestJS backends such as Express, and Ember Data adapters. See [docs/ideas.md](docs/ideas.md) for planned extensions.
+### Exporting files
+
+Coverage gaps and each slice's **Files to improve** panel offer **CSV** and **JSON** downloads of every matching file, unpaged, with each metric's percent, covered, and total counts, the slices that include each file, and its gaps (uncovered functions and line ranges; JSON also lists partly taken branches). Exports follow the filters on screen. The same data is available directly:
+
+```bash
+curl -OJ 'http://localhost:3003/api/repositories/<repository-id>/coverage/files/export?slice=idinspect&metric=branches&format=csv'
+```
+
+Not yet supported: Ember apps and Ember Data adapters, whose request URLs are built from model names at runtime, and backend frameworks other than NestJS and Express. See [docs/ideas.md](docs/ideas.md) for planned extensions.
+
+## API for scripts and agents
+
+Everything the dashboard shows comes from a JSON API on the same port, so scripts, notebooks, and AI agents can read it directly. `GET /api` lists every endpoint with a one-line summary and its query parameters; it is generated from the same list the server registers, so it stays current.
+
+```bash
+curl -s http://localhost:3003/api | jq '.endpoints[] | "\(.method) \(.path)"'
+```
+
+Common recipes:
+
+```bash
+BASE=http://localhost:3003
+# Find a repository id by name.
+REPO=$(curl -s $BASE/api/repositories | jq -r '.repositories[] | select(.name == "idplans-platform") | .id')
+
+# Every slice with current coverage, per backend.
+curl -s "$BASE/api/repositories/$REPO/slices" | jq '.slices[] | {name, branches: .coverage.branches.percent, backends: [.backends[] | {directory, branches: .coverage.branches.percent}]}'
+
+# One slice's endpoints and unmatched requests.
+curl -s "$BASE/api/repositories/$REPO/slices/idinspect" | jq '.slice | {endpoints: (.endpoints | length), unmatchedCalls}'
+
+# The weakest files in a slice, with where their gaps are.
+curl -s "$BASE/api/repositories/$REPO/coverage/files/export?slice=idinspect&metric=branches&format=json" \
+  | jq '.files[:10][] | {path, branches: .branches.percent, functions: [.details.uncoveredFunctions[]?.name], lines: .details.uncoveredLines}'
+
+# One file's gaps.
+curl -s "$BASE/api/repositories/$REPO/coverage/file?path=apps/idp-api-service/src/user/user.service.ts" | jq '.file.details'
+```
+
+Things worth knowing when reading the data:
+
+- Per-file coverage and gaps come from each app's **latest snapshot**, which only GitHub-ref runs update. Compare `snapshot.resolvedSha` (or a slice's `coverageSha`) with your checkout before treating a gap as current.
+- Slices reflect the commit they were baked from (`resolvedSha`); rebake after endpoint or module changes.
+- Queuing runs (`POST /runs`) and slice builds (`POST /slices/builds`) starts real work on the worker; read-only use never changes anything.
+
+A Claude Code skill in [`.claude/skills/qa-buddy`](.claude/skills/qa-buddy/SKILL.md) teaches agents these recipes. It loads automatically for sessions started in this repository. To use it from any directory, such as a checkout of a repository QA Buddy measures, link it into your user skills:
+
+```bash
+mkdir -p ~/.claude/skills && ln -s "$(pwd)/.claude/skills/qa-buddy" ~/.claude/skills/qa-buddy
+```
 
 ## Architecture and security
 

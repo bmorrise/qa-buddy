@@ -9,6 +9,7 @@ import type {
 } from "@qa-buddy/shared";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import { FileRowWithGaps } from "../components/FileGaps";
 import { Icon } from "../components/Icon";
 import { Loading } from "../components/Loading";
 
@@ -103,6 +104,15 @@ export function CoverageGapsPage() {
   if (error && !repository) return <div className="page"><div className="alert alert-error" role="alert">{error}</div></div>;
   if (!repository || !snapshots) return <Loading label="Loading coverage…" />;
 
+  const exportLink = (format: "csv" | "json") => {
+    const parameters = new URLSearchParams({ metric, format });
+    if (appName) parameters.set("app", appName);
+    if (sliceName) parameters.set("slice", sliceName);
+    if (maxPercent !== undefined) parameters.set("maxPercent", String(maxPercent));
+    if (search.trim()) parameters.set("search", search.trim());
+    return `/api/repositories/${repositoryId}/coverage/files/export?${parameters.toString()}`;
+  };
+
   const resetPaging = <T,>(setter: (value: T) => void) => (value: T) => {
     setOffset(0);
     setter(value);
@@ -169,7 +179,14 @@ export function CoverageGapsPage() {
           <section className="panel">
             <div className="panel-heading">
               <div><span className="eyebrow">Weakest first</span><h2>Files</h2></div>
-              <span className="muted">{page ? `${page.total} matching files` : "…"}</span>
+              <div className="panel-heading-meta">
+                <span className="muted">{page ? `${page.total} matching files` : "…"}</span>
+                <span className="slice-export" role="group" aria-label="Download the matching files">
+                  <Icon name="download" size={14} />
+                  <a href={exportLink("csv")} download>CSV</a>
+                  <a href={exportLink("json")} download>JSON</a>
+                </span>
+              </div>
             </div>
             <div className="gap-filters">
               <label>
@@ -252,14 +269,18 @@ export function CoverageGapsPage() {
                   </thead>
                   <tbody>
                     {page?.files.map((file) => (
-                      <tr key={`${file.appName}:${file.path}`}>
-                        <td><code className="gap-path">{file.path}</code></td>
+                      <FileRowWithGaps
+                        key={`${file.appName}:${file.path}`}
+                        repositoryId={repositoryId}
+                        path={file.path}
+                        columnCount={appName === "" ? 6 : 5}
+                      >
                         {appName === "" && <td>{file.appName}</td>}
                         <td><Metric value={file.lines} /></td>
                         <td><Metric value={file.statements} /></td>
                         <td><Metric value={file.functions} /></td>
                         <td><Metric value={file.branches} /></td>
-                      </tr>
+                      </FileRowWithGaps>
                     ))}
                   </tbody>
                 </table>

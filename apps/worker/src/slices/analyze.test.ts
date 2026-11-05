@@ -6,7 +6,7 @@ import { analyzeSlices } from "./analyze.js";
 import { parseModule } from "./module-graph.js";
 import { assignOperationIds } from "./nest-modules.js";
 import { parseControllerEndpoints, swaggerPath, type NestEndpoint } from "./nest-endpoints.js";
-import { CLIENT, OPTIONS, write, writeFixture } from "./test-fixture.js";
+import { CLIENT, EXPRESS_BACKEND, NEST_BACKEND, OPTIONS, write, writeFixture } from "./test-fixture.js";
 
 describe("slice analysis", () => {
   let directory: string;
@@ -88,8 +88,45 @@ describe("slice analysis", () => {
     ]);
   });
 
+  it("adds hand-written requests to an Express backend as a second backend of the slice", async () => {
+    const {
+      slices: [inspect]
+    } = await analyzeSlices(directory, [{ name: "inspect", frontendDirectory: "apps/inspect" }], [NEST_BACKEND, EXPRESS_BACKEND]);
+
+    const legacy = inspect!.endpoints.filter((endpoint) => endpoint.backendDirectory === "apps/legacy");
+    expect(legacy.map((endpoint) => [endpoint.httpMethod, endpoint.path, endpoint.clientNames])).toEqual([
+      ["get", "/health-check", ["apps/inspect/src/legacy-calls.ts:12"]],
+      ["post", "/login", ["apps/inspect/src/legacy-calls.ts:5"]],
+      ["get", "/users/{username}", ["apps/inspect/src/legacy-calls.ts:4"]],
+      ["put", "/users/{username}/settings/{app?}", ["apps/inspect/src/legacy-calls.ts:8"]],
+      ["get", "/work-orders/count", ["apps/inspect/src/legacy-calls.ts:10"]]
+    ]);
+    expect(inspect!.backends.map((backend) => [backend.directory, backend.endpointCount, backend.files])).toEqual([
+      ["apps/api", 3, [
+        "apps/api/src/common/dates.ts",
+        "apps/api/src/inspection/inspection.controller.ts",
+        "apps/api/src/inspection/inspection.service.ts",
+        "apps/api/src/work-order/work-order.controller.ts"
+      ]],
+      ["apps/legacy", 5, [
+        // The route index serves /health-check, but its sibling mounts are not dependencies.
+        "apps/legacy/libs/users.js",
+        "apps/legacy/libs/work-orders.js",
+        "apps/legacy/models/index.js",
+        "apps/legacy/models/user.js",
+        "apps/legacy/routes/index.js",
+        "apps/legacy/routes/users.js",
+        "apps/legacy/routes/workOrderRoutes/index.js"
+      ]]
+    ]);
+    expect(inspect!.backendFiles).toHaveLength(11);
+    expect(inspect!.unmatchedCalls).toEqual([
+      { backendDirectory: "apps/legacy", site: "apps/inspect/src/legacy-calls.ts:13", method: "patch", path: "/nowhere/{}" }
+    ]);
+  });
+
   it("fails when the backend workspace does not exist", async () => {
-    await expect(analyzeSlices(directory, null, { ...OPTIONS, backendDirectory: "apps/nope" })).rejects.toThrow(
+    await expect(analyzeSlices(directory, null, [{ ...OPTIONS[0]!, directory: "apps/nope" }])).rejects.toThrow(
       "apps/nope is not a pnpm workspace"
     );
   });

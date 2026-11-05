@@ -8,6 +8,8 @@ import type {
   AppGroupInput,
   AppRun,
   AppRunStatus,
+  CoverageFileDetail,
+  CoverageFileDetails,
   CoverageFileEntry,
   CoverageFilePage,
   CoverageFileQuery,
@@ -28,10 +30,19 @@ import type {
   SliceBuildStatus,
   SliceConfig,
   SliceDetail,
+  SliceBackendSummary,
   SliceEndpoint,
+  SliceUnmatchedCall,
+  CoverageExportRow,
   TestResults
 } from "@qa-buddy/shared";
-import { activeRunStatuses, activeSliceBuildStatuses, coverageMetricNames, terminalRunStatuses } from "@qa-buddy/shared";
+import {
+  activeRunStatuses,
+  activeSliceBuildStatuses,
+  coverageMetricNames,
+  normalizeSliceConfig,
+  terminalRunStatuses
+} from "@qa-buddy/shared";
 
 const initialMigrationSql = `
   CREATE TABLE repositories (
@@ -345,6 +356,25 @@ const migrations = [
       );
       CREATE INDEX slice_history_repository_idx ON slice_history(repository_id, recorded_at ASC);
     `
+  },
+  {
+    version: 18,
+    // Slices may span several backends: each slice file records the backend it
+    // belongs to, and slices keep a per-backend summary and unmatched requests.
+    sql: `
+      ALTER TABLE slice_files ADD COLUMN backend_directory TEXT NOT NULL DEFAULT '';
+      UPDATE slice_files SET backend_directory = (
+        SELECT backend_directory FROM slices WHERE slices.id = slice_files.slice_id
+      );
+      ALTER TABLE slices ADD COLUMN backends_json TEXT NOT NULL DEFAULT '[]';
+      UPDATE slices SET backends_json = json_array(json_object('directory', backend_directory, 'endpointCount', endpoint_count));
+      ALTER TABLE slices ADD COLUMN unmatched_calls_json TEXT NOT NULL DEFAULT '[]';
+    `
+  },
+  {
+    version: 19,
+    // Where each file's gaps are: uncovered line ranges, functions, and branches.
+    sql: "ALTER TABLE coverage_files ADD COLUMN details_json TEXT;"
   }
 ] as const;
 
@@ -453,6 +483,7 @@ interface CoverageFileRowRecord {
   app_name: string;
   snapshot_id: string;
   file_path: string;
+  details_json?: string | null;
   lines_covered: number | null;
   lines_total: number | null;
   statements_covered: number | null;
@@ -492,6 +523,8 @@ type SliceRow = {
   endpoint_count: number;
   file_count: number;
   endpoints_json: string;
+  backends_json: string;
+  unmatched_calls_json: string;
   measured_files: number;
   /** `captured_at|resolved_sha` of the newest snapshot a slice file came from. */
   coverage_source: string | null;
@@ -511,10 +544,12 @@ type SliceHistoryRow = {
 export interface SliceInput {
   name: string;
   frontendDirectory: string;
-  backendDirectory: string;
   endpoints: SliceEndpoint[];
-  files: string[];
+  backends: Array<{ directory: string; endpointCount: number; files: string[] }>;
+  unmatchedCalls?: SliceUnmatchedCall[];
 }
+
+type MetricSums = Record<`${CoverageMetricName}_${"covered" | "total"}`, number | null>;
 
 function now(): string {
   return new Date().toISOString();
@@ -1150,8 +1185,8 @@ export class QaBuddyDatabase {
         INSERT INTO coverage_files(
           snapshot_id, file_path,
           lines_covered, lines_total, statements_covered, statements_total,
-          functions_covered, functions_total, branches_covered, branches_total
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          functions_covered, functions_total, branches_covered, branches_total, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const file of values.files) {
         statement.run(
@@ -1164,10 +1199,31 @@ export class QaBuddyDatabase {
           file.functions?.covered ?? null,
           file.functions?.total ?? null,
           file.branches?.covered ?? null,
-          file.branches?.total ?? null
+          file.branches?.total ?? null,
+          file.details ? JSON.stringify(file.details) : null
         );
       }
     })();
+  }
+
+  /** One file's current coverage and gap details, or null when no snapshot lists it. */
+  getCoverageFile(repositoryId: string, filePath: string): CoverageFileDetail | null {
+    const row = this.connection
+      .prepare(`
+        SELECT s.app_name, s.run_id, s.resolved_sha, s.captured_at, f.* FROM coverage_files f
+        JOIN coverage_snapshots s ON s.id = f.snapshot_id
+        WHERE s.repository_id = ? AND f.file_path = ?
+        ORDER BY s.captured_at DESC LIMIT 1
+      `)
+      .get(repositoryId, filePath) as
+      | (CoverageFileRowRecord & { run_id: string | null; resolved_sha: string | null; captured_at: string })
+      | undefined;
+    if (!row) return null;
+    return {
+      ...this.mapCoverageFileRow(row),
+      details: row.details_json ? (JSON.parse(row.details_json) as CoverageFileDetails) : null,
+      snapshot: { runId: row.run_id, resolvedSha: row.resolved_sha, capturedAt: row.captured_at }
+    };
   }
 
   listCoverageSnapshots(repositoryId: string): CoverageSnapshot[] {
@@ -1225,7 +1281,11 @@ export class QaBuddyDatabase {
     });
   }
 
-  queryCoverageFiles(repositoryId: string, query: CoverageFileQuery = {}): CoverageFilePage {
+  queryCoverageFiles(
+    repositoryId: string,
+    query: CoverageFileQuery = {},
+    options: { includeDetails?: boolean } = {}
+  ): CoverageFilePage {
     const metric: CoverageMetricName = coverageMetricNames.includes(query.metric as CoverageMetricName)
       ? (query.metric as CoverageMetricName)
       : "lines";
@@ -1278,7 +1338,18 @@ export class QaBuddyDatabase {
       `)
       .all(...parameters, limit, offset) as CoverageFileRowRecord[];
 
-    return { files: rows.map((row) => this.mapCoverageFileRow(row)), total, limit, offset };
+    return {
+      files: rows.map((row) => {
+        const file = this.mapCoverageFileRow(row);
+        // Paged lists stay lean; exports ask for the gap details.
+        return options.includeDetails
+          ? { ...file, details: row.details_json ? (JSON.parse(row.details_json) as CoverageFileDetails) : null }
+          : file;
+      }),
+      total,
+      limit,
+      offset
+    };
   }
 
   updateRun(
@@ -1525,7 +1596,7 @@ export class QaBuddyDatabase {
     const row = this.connection
       .prepare("SELECT slice_config_json FROM repositories WHERE id = ?")
       .get(repositoryId) as { slice_config_json: string | null } | undefined;
-    return row?.slice_config_json ? (JSON.parse(row.slice_config_json) as SliceConfig) : null;
+    return row?.slice_config_json ? normalizeSliceConfig(JSON.parse(row.slice_config_json)) : null;
   }
 
   setSliceConfig(repositoryId: string, config: SliceConfig): SliceConfig {
@@ -1548,7 +1619,7 @@ export class QaBuddyDatabase {
       error: row.error,
       sliceCount: row.slice_count,
       skipped: JSON.parse(row.skipped_json) as SliceBuild["skipped"],
-      config: JSON.parse(row.config_json) as SliceConfig,
+      config: normalizeSliceConfig(JSON.parse(row.config_json)),
       createdAt: row.created_at,
       startedAt: row.started_at,
       finishedAt: row.finished_at
@@ -1662,32 +1733,39 @@ export class QaBuddyDatabase {
       const insertSlice = this.connection.prepare(`
         INSERT INTO slices(
           id, repository_id, build_id, name, frontend_directory, backend_directory,
-          resolved_sha, built_at, endpoint_count, file_count, endpoints_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          resolved_sha, built_at, endpoint_count, file_count, endpoints_json, backends_json, unmatched_calls_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      const insertFile = this.connection.prepare("INSERT OR IGNORE INTO slice_files(slice_id, file_path) VALUES (?, ?)");
+      const insertFile = this.connection.prepare(
+        "INSERT OR IGNORE INTO slice_files(slice_id, file_path, backend_directory) VALUES (?, ?, ?)"
+      );
       for (const slice of slices) {
         const sliceId = randomUUID();
+        const files = new Set(slice.backends.flatMap((backend) => backend.files));
         insertSlice.run(
           sliceId,
           repositoryId,
           buildId,
           slice.name,
           slice.frontendDirectory,
-          slice.backendDirectory,
+          slice.backends[0]?.directory ?? "",
           resolvedSha,
           timestamp,
           slice.endpoints.length,
-          new Set(slice.files).size,
-          JSON.stringify(slice.endpoints)
+          files.size,
+          JSON.stringify(slice.endpoints),
+          JSON.stringify(slice.backends.map((backend) => ({ directory: backend.directory, endpointCount: backend.endpointCount }))),
+          JSON.stringify(slice.unmatchedCalls ?? [])
         );
-        for (const file of slice.files) insertFile.run(sliceId, file);
+        for (const backend of slice.backends) {
+          for (const file of backend.files) insertFile.run(sliceId, file, backend.directory);
+        }
       }
       this.seedSliceHistory(repositoryId);
     })();
   }
 
-  /** Records each slice's coverage from the snapshot it is currently measured against, once per run. */
+  /** Records each slice's coverage from the snapshots it is currently measured against, once per run. */
   private seedSliceHistory(repositoryId: string): void {
     for (const slice of this.listSlices(repositoryId)) {
       if (slice.measuredFileCount === 0 || !slice.coverageCapturedAt) continue;
@@ -1756,9 +1834,24 @@ export class QaBuddyDatabase {
       );
   }
 
+  /** Per-file coverage from the current snapshots for files under one backend directory. */
+  private snapshotFilesUnder(repositoryId: string, directory: string): Map<string, CoverageFileEntry> {
+    const rows = this.connection
+      .prepare(`
+        SELECT s.app_name, f.* FROM coverage_files f
+        JOIN coverage_snapshots s ON s.id = f.snapshot_id
+        WHERE s.repository_id = ? AND substr(f.file_path, 1, ?) = ?
+      `)
+      .all(repositoryId, directory.length + 1, `${directory}/`) as CoverageFileRowRecord[];
+    return new Map(rows.map((row) => [row.file_path, this.mapCoverageFileRow(row)] as const));
+  }
+
   /**
-   * Records one run's coverage for every slice measured against the app that
-   * just finished. Returns how many slice points were written.
+   * Records one run's point for every slice that reaches a backend the run
+   * tested. A slice spanning several backends takes this run's files for the
+   * backends that ran and the current snapshot for the rest, so a run that
+   * tested only one backend never drops the other from the total. Returns how
+   * many slice points were written.
    */
   recordSliceHistory(values: {
     repositoryId: string;
@@ -1767,23 +1860,42 @@ export class QaBuddyDatabase {
     resolvedSha: string | null;
     useLocalWorkingTree: boolean;
     dirty: boolean;
-    workingDirectory: string;
-    files: CoverageFileEntry[];
+    /** This run's per-file coverage, keyed by app working directory. */
+    filesByDirectory: Map<string, CoverageFileEntry[]>;
   }): number {
+    const ranDirectories = Array.from(values.filesByDirectory.entries())
+      .filter(([, files]) => files.length > 0)
+      .map(([directory]) => directory);
+    if (ranDirectories.length === 0) return 0;
     const slices = this.connection
-      .prepare("SELECT id, name FROM slices WHERE repository_id = ? AND backend_directory = ?")
-      .all(values.repositoryId, values.workingDirectory) as Array<{ id: string; name: string }>;
-    if (slices.length === 0 || values.files.length === 0) return 0;
-    const byPath = new Map(values.files.map((file) => [file.path, file] as const));
+      .prepare(`
+        SELECT DISTINCT sl.id, sl.name FROM slices sl JOIN slice_files sf ON sf.slice_id = sl.id
+        WHERE sl.repository_id = ? AND sf.backend_directory IN (${placeholders(ranDirectories)})
+      `)
+      .all(values.repositoryId, ...ranDirectories) as Array<{ id: string; name: string }>;
+    if (slices.length === 0) return 0;
+
+    const ranFiles = new Map<string, Map<string, CoverageFileEntry>>();
+    for (const directory of ranDirectories) {
+      ranFiles.set(directory, new Map(values.filesByDirectory.get(directory)!.map((file) => [file.path, file] as const)));
+    }
+    const snapshotFiles = new Map<string, Map<string, CoverageFileEntry>>();
+    const lookup = (directory: string, filePath: string): CoverageFileEntry | undefined => {
+      const ran = ranFiles.get(directory);
+      if (ran) return ran.get(filePath);
+      if (!snapshotFiles.has(directory)) snapshotFiles.set(directory, this.snapshotFilesUnder(values.repositoryId, directory));
+      return snapshotFiles.get(directory)!.get(filePath);
+    };
+
     const recordedAt = now();
     let written = 0;
     this.connection.transaction(() => {
       for (const slice of slices) {
-        const paths = this.connection
-          .prepare("SELECT file_path FROM slice_files WHERE slice_id = ?")
-          .all(slice.id) as Array<{ file_path: string }>;
-        const measured = paths.flatMap(({ file_path }) => {
-          const file = byPath.get(file_path);
+        const files = this.connection
+          .prepare("SELECT file_path, backend_directory FROM slice_files WHERE slice_id = ?")
+          .all(slice.id) as Array<{ file_path: string; backend_directory: string }>;
+        const measured = files.flatMap(({ file_path, backend_directory }) => {
+          const file = lookup(backend_directory, file_path);
           return file ? [file] : [];
         });
         if (measured.length === 0) continue;
@@ -1806,63 +1918,141 @@ export class QaBuddyDatabase {
     return written;
   }
 
-  private mapSlice(row: SliceRow): Slice {
-    const [capturedAt, sha] = row.coverage_source ? row.coverage_source.split("|") : [null, null];
+  private sumsToCoverage(row: MetricSums, measured: number): CoverageSummary {
     return {
-      name: row.name,
-      frontendDirectory: row.frontend_directory,
-      backendDirectory: row.backend_directory,
-      buildId: row.build_id,
-      resolvedSha: row.resolved_sha,
-      builtAt: row.built_at,
-      endpointCount: row.endpoint_count,
-      fileCount: row.file_count,
-      measuredFileCount: row.measured_files,
-      coverage: {
-        lines: row.measured_files ? percentMetric(row.lines_covered, row.lines_total) : null,
-        statements: row.measured_files ? percentMetric(row.statements_covered, row.statements_total) : null,
-        functions: row.measured_files ? percentMetric(row.functions_covered, row.functions_total) : null,
-        branches: row.measured_files ? percentMetric(row.branches_covered, row.branches_total) : null
-      },
-      coverageCapturedAt: capturedAt || null,
-      coverageSha: sha || null
+      lines: measured ? percentMetric(row.lines_covered, row.lines_total) : null,
+      statements: measured ? percentMetric(row.statements_covered, row.statements_total) : null,
+      functions: measured ? percentMetric(row.functions_covered, row.functions_total) : null,
+      branches: measured ? percentMetric(row.branches_covered, row.branches_total) : null
     };
   }
 
   /**
    * Current slice coverage, summed from the coverage snapshots in the same
-   * repository. Only files under the slice's backend directory are joined, so
-   * another app's report that happens to list the same path cannot count twice.
+   * repository, per slice and backend. Each slice file joins only snapshot
+   * rows under its own backend directory, so another app's report that
+   * happens to list the same path cannot count twice.
    */
-  private sliceRows(repositoryId: string, sliceName?: string): SliceRow[] {
+  private sliceBackendRows(repositoryId: string, sliceName?: string) {
     const sums = coverageMetricNames
       .flatMap((metric) => [`SUM(f.${metric}_covered) AS ${metric}_covered`, `SUM(f.${metric}_total) AS ${metric}_total`])
       .join(", ");
     return this.connection
       .prepare(`
-        SELECT sl.*, COUNT(f.file_path) AS measured_files, ${sums},
+        SELECT sl.id AS slice_id, sf.backend_directory, COUNT(sf.file_path) AS file_count,
+          COUNT(f.file_path) AS measured_files, ${sums},
           MAX(cs.captured_at || '|' || COALESCE(cs.resolved_sha, '')) AS coverage_source
         FROM slices sl
-        LEFT JOIN slice_files sf ON sf.slice_id = sl.id
+        JOIN slice_files sf ON sf.slice_id = sl.id
         LEFT JOIN (coverage_files f JOIN coverage_snapshots cs ON cs.id = f.snapshot_id)
           ON f.file_path = sf.file_path
           AND cs.repository_id = sl.repository_id
-          AND substr(f.file_path, 1, length(sl.backend_directory) + 1) = sl.backend_directory || '/'
+          AND substr(f.file_path, 1, length(sf.backend_directory) + 1) = sf.backend_directory || '/'
         WHERE sl.repository_id = ? ${sliceName ? "AND sl.name = ? COLLATE NOCASE" : ""}
-        GROUP BY sl.id
-        ORDER BY sl.name COLLATE NOCASE ASC
+        GROUP BY sl.id, sf.backend_directory
+      `)
+      .all(...(sliceName ? [repositoryId, sliceName] : [repositoryId])) as Array<
+      MetricSums & { slice_id: string; backend_directory: string; file_count: number; measured_files: number; coverage_source: string | null }
+    >;
+  }
+
+  private sliceRecords(repositoryId: string, sliceName?: string): Array<{ row: SliceRow; slice: Slice }> {
+    const rows = this.connection
+      .prepare(`
+        SELECT * FROM slices WHERE repository_id = ? ${sliceName ? "AND name = ? COLLATE NOCASE" : ""}
+        ORDER BY name COLLATE NOCASE ASC
       `)
       .all(...(sliceName ? [repositoryId, sliceName] : [repositoryId])) as SliceRow[];
+    const backendRows = this.sliceBackendRows(repositoryId, sliceName);
+
+    return rows.map((row) => {
+      const declared = JSON.parse(row.backends_json) as Array<{ directory: string; endpointCount: number }>;
+      const mine = backendRows.filter((backend) => backend.slice_id === row.id);
+      const totals = {} as MetricSums;
+      for (const metric of coverageMetricNames) {
+        for (const part of ["covered", "total"] as const) {
+          const key = `${metric}_${part}` as const;
+          const values = mine.map((backend) => backend[key]).filter((value): value is number => value !== null);
+          totals[key] = values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+        }
+      }
+      const measured = mine.reduce((sum, backend) => sum + backend.measured_files, 0);
+      const source = mine
+        .map((backend) => backend.coverage_source)
+        .filter((value): value is string => Boolean(value))
+        .sort()
+        .at(-1);
+      const [capturedAt, sha] = source ? source.split("|") : [null, null];
+      const backends: SliceBackendSummary[] = declared.map((backend) => {
+        const stats = mine.find((candidate) => candidate.backend_directory === backend.directory);
+        return {
+          directory: backend.directory,
+          endpointCount: backend.endpointCount,
+          fileCount: stats?.file_count ?? 0,
+          measuredFileCount: stats?.measured_files ?? 0,
+          coverage: stats ? this.sumsToCoverage(stats, stats.measured_files) : { lines: null, statements: null, functions: null, branches: null }
+        };
+      });
+      return {
+        row,
+        slice: {
+          name: row.name,
+          frontendDirectory: row.frontend_directory,
+          buildId: row.build_id,
+          resolvedSha: row.resolved_sha,
+          builtAt: row.built_at,
+          endpointCount: row.endpoint_count,
+          fileCount: row.file_count,
+          measuredFileCount: measured,
+          coverage: this.sumsToCoverage(totals, measured),
+          coverageCapturedAt: capturedAt || null,
+          coverageSha: sha || null,
+          backends,
+          unmatchedCallCount: (JSON.parse(row.unmatched_calls_json) as unknown[]).length
+        }
+      };
+    });
   }
 
   listSlices(repositoryId: string): Slice[] {
-    return this.sliceRows(repositoryId).map((row) => this.mapSlice(row));
+    return this.sliceRecords(repositoryId).map(({ slice }) => slice);
   }
 
   getSlice(repositoryId: string, name: string): SliceDetail | null {
-    const row = this.sliceRows(repositoryId, name)[0];
-    if (!row) return null;
-    return { ...this.mapSlice(row), endpoints: JSON.parse(row.endpoints_json) as SliceEndpoint[] };
+    const record = this.sliceRecords(repositoryId, name)[0];
+    if (!record) return null;
+    const fallbackBackend = record.row.backend_directory;
+    return {
+      ...record.slice,
+      endpoints: (JSON.parse(record.row.endpoints_json) as SliceEndpoint[]).map((endpoint) => ({
+        ...endpoint,
+        backendDirectory: endpoint.backendDirectory ?? fallbackBackend
+      })),
+      unmatchedCalls: JSON.parse(record.row.unmatched_calls_json) as SliceUnmatchedCall[]
+    };
+  }
+
+  /**
+   * Every coverage file matching the filters, unpaged, with the slices that
+   * include it. Used for CSV and JSON exports.
+   */
+  exportCoverageFiles(repositoryId: string, query: Omit<CoverageFileQuery, "limit" | "offset"> = {}): CoverageExportRow[] {
+    const membership = new Map<string, string[]>();
+    const rows = this.connection
+      .prepare(`
+        SELECT sf.file_path, sl.name FROM slice_files sf JOIN slices sl ON sl.id = sf.slice_id
+        WHERE sl.repository_id = ? ORDER BY sl.name COLLATE NOCASE
+      `)
+      .all(repositoryId) as Array<{ file_path: string; name: string }>;
+    for (const row of rows) membership.set(row.file_path, [...(membership.get(row.file_path) ?? []), row.name]);
+
+    const files: CoverageExportRow[] = [];
+    for (let offset = 0; ; offset += 1_000) {
+      const page = this.queryCoverageFiles(repositoryId, { ...query, limit: 1_000, offset }, { includeDetails: true });
+      for (const file of page.files) files.push({ ...file, slices: membership.get(file.path) ?? [] });
+      if (offset + page.files.length >= page.total || page.files.length === 0) break;
+    }
+    return files;
   }
 
   /** Slice trend points, shaped like app coverage history with the slice name as the app. */

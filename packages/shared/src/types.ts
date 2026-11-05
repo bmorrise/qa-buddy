@@ -84,12 +84,27 @@ export interface CoverageSummary {
   branches: CoverageMetric | null;
 }
 
+/**
+ * Where a file's coverage gaps are, from Istanbul's detailed report or LCOV.
+ * Lists are capped per file, so a very large file reports its first gaps.
+ */
+export interface CoverageFileDetails {
+  /** Inclusive line ranges with no executed statement, for example `[[12, 18], [40, 40]]`. */
+  uncoveredLines: Array<[number, number]>;
+  /** Functions never called, with the line they are declared on. */
+  uncoveredFunctions: Array<{ name: string; line: number }>;
+  /** Branch points with at least one path never taken. */
+  uncoveredBranches: Array<{ line: number; type: string; uncovered: number; total: number }>;
+}
+
 export interface CoverageFileEntry {
   path: string;
   lines: CoverageMetric | null;
   statements: CoverageMetric | null;
   functions: CoverageMetric | null;
   branches: CoverageMetric | null;
+  /** Present when the run produced a detailed report; absent for summary-only reports. */
+  details?: CoverageFileDetails | null;
 }
 
 export interface CoverageReport {
@@ -153,6 +168,17 @@ export interface CoverageFileQuery {
 
 export interface CoverageFileRow extends CoverageFileEntry {
   appName: string;
+}
+
+/** A coverage file row in an export, with the slices that include it. */
+export interface CoverageExportRow extends CoverageFileRow {
+  slices: string[];
+}
+
+/** One file's coverage, gaps, and the snapshot it came from. */
+export interface CoverageFileDetail extends CoverageFileRow {
+  details: CoverageFileDetails | null;
+  snapshot: { runId: string | null; resolvedSha: string | null; capturedAt: string };
 }
 
 export interface CoverageFilePage {
@@ -310,22 +336,80 @@ export const terminalRunStatuses: RunStatus[] = [
 
 // ----- Slices: backend coverage per frontend app -------------------------------
 
+export type SliceBackendFramework = "nestjs" | "express";
+
+/** One backend a slice can reach, and how frontend calls to it are recognised. */
+export interface SliceBackendConfig {
+  /** Backend workspace, for example `apps/idp-api-service`. */
+  directory: string;
+  framework: SliceBackendFramework;
+  /** Generated orval client the frontends import endpoint calls from (NestJS only). */
+  clientPackage: string | null;
+  /** NestJS root module relative to the workspace, normally `src/app.module.ts`. */
+  rootModule: string | null;
+  /** Express entry file relative to the workspace, normally `app.js`. */
+  entryFile: string | null;
+  /**
+   * Names the backend's base URL goes by in frontend code, such as
+   * `VITE_AUTH_API_HOST` or `apiHost`. Requests built from them are matched to
+   * routes by path.
+   */
+  baseUrlNames: string[];
+}
+
 /**
  * How a repository's slices are derived. A slice is every backend file a
- * frontend app depends on, traced from the generated-client calls it makes.
+ * frontend app depends on, across one or more backends.
  */
 export interface SliceConfig {
-  /** NestJS backend workspace, for example `apps/idp-api-service`. */
-  backendDirectory: string;
-  /** Generated API client package the frontends call through. */
-  clientPackage: string;
-  /** Root module relative to the backend workspace, normally `src/app.module.ts`. */
-  rootModule: string;
+  backends: SliceBackendConfig[];
   /**
    * Frontend workspaces to slice. Empty means every `apps/*` workspace that
-   * depends on the client package.
+   * depends on one of the backends' client packages.
    */
   frontendDirectories: string[];
+}
+
+/**
+ * Reads a stored recipe, upgrading the original single-backend shape
+ * (`backendDirectory`, `clientPackage`, `rootModule`) to a backend list.
+ */
+export function normalizeSliceConfig(value: unknown): SliceConfig {
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const strings = (input: unknown): string[] => (Array.isArray(input) ? input.filter((item): item is string => typeof item === "string") : []);
+  const text = (input: unknown): string | null => (typeof input === "string" && input ? input : null);
+  if (!Array.isArray(raw.backends)) {
+    return {
+      backends: text(raw.backendDirectory)
+        ? [
+            {
+              directory: text(raw.backendDirectory)!,
+              framework: "nestjs",
+              clientPackage: text(raw.clientPackage),
+              rootModule: text(raw.rootModule) ?? "src/app.module.ts",
+              entryFile: null,
+              baseUrlNames: []
+            }
+          ]
+        : [],
+      frontendDirectories: strings(raw.frontendDirectories)
+    };
+  }
+  return {
+    backends: raw.backends.map((entry) => {
+      const backend = (entry ?? {}) as Record<string, unknown>;
+      const framework: SliceBackendFramework = backend.framework === "express" ? "express" : "nestjs";
+      return {
+        directory: text(backend.directory) ?? "",
+        framework,
+        clientPackage: framework === "nestjs" ? text(backend.clientPackage) : null,
+        rootModule: framework === "nestjs" ? text(backend.rootModule) ?? "src/app.module.ts" : null,
+        entryFile: framework === "express" ? text(backend.entryFile) ?? "app.js" : null,
+        baseUrlNames: strings(backend.baseUrlNames)
+      };
+    }),
+    frontendDirectories: strings(raw.frontendDirectories)
+  };
 }
 
 export type SliceBuildStatus = "queued" | "running" | "passed" | "failed";
@@ -350,20 +434,39 @@ export interface SliceBuild {
 }
 
 export interface SliceEndpoint {
+  /** Backend workspace serving the endpoint. Older builds stored one backend per slice. */
+  backendDirectory?: string;
   httpMethod: string;
   path: string;
   controller: string;
   methodKey: string;
   /** Repository-relative controller file. */
   file: string;
-  /** Generated client exports the frontend used to call it. */
+  /** Generated client exports, or `file:line` request sites, that reach it. */
   clientNames: string[];
+}
+
+/** A hand-written request to a configured backend that matched no route. */
+export interface SliceUnmatchedCall {
+  backendDirectory: string;
+  /** Repository-relative `file:line` of the request. */
+  site: string;
+  method: string | null;
+  path: string;
+}
+
+/** One backend's share of a slice. */
+export interface SliceBackendSummary {
+  directory: string;
+  endpointCount: number;
+  fileCount: number;
+  measuredFileCount: number;
+  coverage: CoverageSummary;
 }
 
 export interface Slice {
   name: string;
   frontendDirectory: string;
-  backendDirectory: string;
   buildId: string;
   /** Commit the slice was traced from. */
   resolvedSha: string | null;
@@ -374,13 +477,18 @@ export interface Slice {
   measuredFileCount: number;
   /** Current coverage of the slice, from the latest coverage snapshot. */
   coverage: CoverageSummary;
-  /** Capture time and commit of the snapshot the coverage came from. */
+  /** Capture time and commit of the newest snapshot the coverage came from. */
   coverageCapturedAt: string | null;
   coverageSha: string | null;
+  /** Per-backend breakdown; the slice totals sum these. */
+  backends: SliceBackendSummary[];
+  /** Requests that matched no route, worth checking when a slice looks small. */
+  unmatchedCallCount: number;
 }
 
 export interface SliceDetail extends Slice {
   endpoints: SliceEndpoint[];
+  unmatchedCalls: SliceUnmatchedCall[];
 }
 
 export interface SliceOverview {

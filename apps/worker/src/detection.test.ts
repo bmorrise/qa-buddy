@@ -47,8 +47,8 @@ describe("pnpm and Turborepo detection", () => {
     expect(result.workspaceCount).toBe(4);
     expect(result.apps.map((app) => app.name)).toEqual(["@example/admin", "@example/web"]);
     expect(result.apps.map((app) => app.testCommand)).toEqual([
-      "pnpm run test:coverage --coverage.reporter=json-summary --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json",
-      "pnpm test --coverage --coverage.reporter=json-summary --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json"
+      "pnpm run test:coverage --coverage.reporter=json-summary --coverage.reporter=json --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json",
+      "pnpm test --coverage --coverage.reporter=json-summary --coverage.reporter=json --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json"
     ]);
     expect(result.apps.every((app) => app.workingDirectory.startsWith("apps/"))).toBe(true);
   });
@@ -73,11 +73,11 @@ describe("pnpm and Turborepo detection", () => {
       { name: "custom-app", testCommand: "pnpm test --coverage" },
       {
         name: "jest-app",
-        testCommand: "pnpm test --coverage --coverageReporters=json-summary --maxWorkers=2 --workerIdleMemoryLimit=1GB --coveragePathIgnorePatterns=/dist/ --json --outputFile=.qa-buddy-test-results.json"
+        testCommand: "pnpm test --coverage --coverageReporters=json-summary --coverageReporters=json --maxWorkers=2 --workerIdleMemoryLimit=1GB --coveragePathIgnorePatterns=/dist/ --json --outputFile=.qa-buddy-test-results.json"
       },
       {
         name: "vitest-app",
-        testCommand: "pnpm test --coverage --coverage.reporter=json-summary --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json"
+        testCommand: "pnpm test --coverage --coverage.reporter=json-summary --coverage.reporter=json --coverage.reportOnFailure --maxWorkers=2 --minWorkers=1 --reporter=default --reporter=json --outputFile.json=.qa-buddy-test-results.json"
       }
     ]);
   });
@@ -402,5 +402,42 @@ describe("pnpm and Turborepo detection", () => {
         detectPnpmWorkspaceApps(directory, 2, [], ["apps/idcloud", "apps/user-crm-sync"])
       ).rejects.toThrow(/No coverage-capable test scripts.*excluded: apps\/idcloud, apps\/user-crm-sync/);
     });
+  });
+
+  it("attaches gap details from the detailed report next to the summary, and clears it before a run", () => {
+    const root = directory;
+    writeJson(path.join(root, "apps/api/coverage/coverage-summary.json"), {
+      total: { lines: { covered: 1, total: 2 }, statements: { covered: 1, total: 2 }, functions: { covered: 0, total: 1 }, branches: { covered: 0, total: 0 } },
+      [path.join(root, "apps/api/src/users.ts")]: { lines: { covered: 1, total: 2 }, statements: { covered: 1, total: 2 }, functions: { covered: 0, total: 1 }, branches: { covered: 0, total: 0 } }
+    });
+    writeJson(path.join(root, "apps/api/coverage/coverage-final.json"), {
+      [path.join(root, "apps/api/src/users.ts")]: {
+        path: path.join(root, "apps/api/src/users.ts"),
+        statementMap: { "0": { start: { line: 1 } }, "1": { start: { line: 2 } } },
+        s: { "0": 1, "1": 0 },
+        fnMap: { "0": { name: "remove", decl: { start: { line: 2 } } } },
+        f: { "0": 0 },
+        branchMap: {},
+        b: {}
+      }
+    });
+    const discovered = discoverCoverageReport(root, "apps/api");
+    expect(discovered.coverageFiles[0]).toMatchObject({
+      path: "apps/api/src/users.ts",
+      details: { uncoveredLines: [[2, 2]], uncoveredFunctions: [{ name: "remove", line: 2 }], uncoveredBranches: [] }
+    });
+
+    expect(clearAppReports(root, "apps/api")).toEqual(["apps/api/coverage/coverage-summary.json", "apps/api/coverage/coverage-final.json"]);
+    expect(existsSync(path.join(root, "apps/api/coverage/coverage-final.json"))).toBe(false);
+  });
+
+  it("keeps summary coverage when the detailed report is missing or unreadable", () => {
+    writeJson(path.join(directory, "apps/api/coverage/coverage-summary.json"), {
+      total: { lines: { covered: 1, total: 1 }, statements: { covered: 1, total: 1 }, functions: { covered: 1, total: 1 }, branches: { covered: 0, total: 0 } },
+      "apps/api/src/a.ts": { lines: { covered: 1, total: 1 }, statements: { covered: 1, total: 1 }, functions: { covered: 1, total: 1 }, branches: { covered: 0, total: 0 } }
+    });
+    expect(discoverCoverageReport(directory, "apps/api").coverageFiles[0]!.details).toBeUndefined();
+    writeFileSync(path.join(directory, "apps/api/coverage/coverage-final.json"), "{ not json", "utf8");
+    expect(discoverCoverageReport(directory, "apps/api").coverageFiles[0]!.details).toBeUndefined();
   });
 });

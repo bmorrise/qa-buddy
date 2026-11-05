@@ -7,13 +7,18 @@ import {
   appGroupInputSchema,
   appGroupOrderSchema,
   appGroupPatchSchema,
+  coverageExportQuerySchema,
   coverageFileQuerySchema,
+  coverageMetricNames,
+  formatLineRanges,
+  type CoverageExportRow,
   repositoryInputSchema,
   runRequestSchema,
   sliceBuildRequestSchema,
   sliceConfigSchema,
   terminalRunStatuses
 } from "@qa-buddy/shared";
+import { apiEndpoints } from "./api-reference.js";
 import { initialLogOffset, readLogChunk } from "./log-stream.js";
 
 export interface ServerOptions {
@@ -37,15 +42,71 @@ function isUniqueConstraint(error: unknown): boolean {
   );
 }
 
+function csvCell(value: string | number | null): string {
+  if (value === null) return "";
+  const text = String(value);
+  // Semicolons and tabs are quoted too: some spreadsheet apps split on them.
+  return /[",;\t\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+/** One row per file with each metric's percent, covered, and total, ready for spreadsheets. */
+export function coverageFilesCsv(files: CoverageExportRow[]): string {
+  const header = [
+    "file",
+    "app",
+    "slices",
+    ...coverageMetricNames.flatMap((metric) => [`${metric}_percent`, `${metric}_covered`, `${metric}_total`]),
+    "uncovered_functions",
+    "uncovered_lines"
+  ];
+  const rows = files.map((file) => [
+    file.path,
+    file.appName,
+    file.slices.join(", "),
+    ...coverageMetricNames.flatMap((metric) => {
+      const value = file[metric];
+      return value ? [value.percent, value.covered, value.total] : [null, null, null];
+    }),
+    file.details ? file.details.uncoveredFunctions.map((fn) => `${fn.name} (line ${fn.line})`).join(", ") : null,
+    file.details ? formatLineRanges(file.details.uncoveredLines) : null
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+}
+
+function fileSlug(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "export";
+}
+
 function logPath(dataDirectory: string, runId: string): string {
   return path.join(dataDirectory, "logs", `${runId}.log`);
 }
 
+const registeredRoutes = new WeakMap<FastifyInstance, Array<{ method: string; path: string }>>();
+
+/** API routes the server registered, for checking the published reference. */
+export function registeredApiRoutes(app: FastifyInstance): Array<{ method: string; path: string }> {
+  return registeredRoutes.get(app) ?? [];
+}
+
 export async function buildServer(options: ServerOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: options.logger ?? false });
+  const routes: Array<{ method: string; path: string }> = [];
+  registeredRoutes.set(app, routes);
+  app.addHook("onRoute", (route) => {
+    if (!route.url.startsWith("/api")) return;
+    for (const method of Array.isArray(route.method) ? route.method : [route.method]) {
+      if (method !== "HEAD") routes.push({ method, path: route.url });
+    }
+  });
   const { database } = options;
 
   app.get("/api/health", async () => ({ status: "ok", service: "qa-buddy" }));
+
+  app.get("/api", async () => ({
+    service: "qa-buddy",
+    description: "Local test-run and coverage dashboard. Paths are relative to this server; ids come from /api/repositories.",
+    endpoints: apiEndpoints
+  }));
 
   app.get("/api/repositories", async () => ({ repositories: database.listRepositories() }));
 
@@ -249,6 +310,52 @@ export async function buildServer(options: ServerOptions): Promise<FastifyInstan
         return reply.code(404).send({ error: "Repository not found" });
       }
       return { entries: database.listCoverageHistory(request.params.repositoryId) };
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string }; Querystring: Record<string, string | undefined> }>(
+    "/api/repositories/:repositoryId/coverage/files/export",
+    async (request, reply) => {
+      const repository = database.getRepository(request.params.repositoryId);
+      if (!repository) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const parsed = coverageExportQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: issueMessage(parsed.error) });
+      }
+      const { format, app: appName, slice, metric, maxPercent, search } = parsed.data;
+      const filters = { appName, sliceName: slice, metric, maxPercent, search };
+      const files = database.exportCoverageFiles(repository.id, filters);
+      const generatedAt = new Date().toISOString();
+      const name = [fileSlug(repository.name), slice ? fileSlug(slice) : appName ? fileSlug(appName) : "all", "coverage-files", generatedAt.slice(0, 10)].join("-");
+      if (format === "json") {
+        return reply
+          .header("content-disposition", `attachment; filename="${name}.json"`)
+          .send({ repository: { id: repository.id, name: repository.name }, generatedAt, filters, total: files.length, files });
+      }
+      return reply
+        .type("text/csv; charset=utf-8")
+        .header("content-disposition", `attachment; filename="${name}.csv"`)
+        .send(coverageFilesCsv(files));
+    }
+  );
+
+  app.get<{ Params: { repositoryId: string }; Querystring: { path?: string } }>(
+    "/api/repositories/:repositoryId/coverage/file",
+    async (request, reply) => {
+      if (!database.getRepository(request.params.repositoryId)) {
+        return reply.code(404).send({ error: "Repository not found" });
+      }
+      const filePath = request.query.path?.trim();
+      if (!filePath) {
+        return reply.code(400).send({ error: "path: Enter a repository-relative file path" });
+      }
+      const file = database.getCoverageFile(request.params.repositoryId, filePath);
+      if (!file) {
+        return reply.code(404).send({ error: "No coverage snapshot lists this file" });
+      }
+      return { file };
     }
   );
 

@@ -9,7 +9,14 @@ export function write(root: string, file: string, contents: string): void {
 }
 
 export const CLIENT = "@acme/api-client";
-export const OPTIONS = { backendDirectory: "apps/api", clientPackage: CLIENT };
+export const NEST_BACKEND = { directory: "apps/api", framework: "nestjs" as const, clientPackage: CLIENT };
+export const EXPRESS_BACKEND = {
+  directory: "apps/legacy",
+  framework: "express" as const,
+  entryFile: "app.js",
+  baseUrlNames: ["VITE_LEGACY_HOST"]
+};
+export const OPTIONS = [NEST_BACKEND];
 
 /**
  * A small monorepo: two frontends calling a NestJS backend through a generated
@@ -124,5 +131,126 @@ export function writeFixture(root: string): void {
     root,
     "apps/api/src/work-order/work-order.controller.ts",
     `@Controller("work-order")\nexport class WorkOrderController {\n  @Get(":id") getWorkOrder() {}\n}\n`
+  );
+
+  writeExpressFixture(root);
+}
+
+/**
+ * An Express backend in the shape of rpm-api: a route index that mounts every
+ * sibling file, a nested router with a prefix, and models loaded from disk.
+ * The inspect frontend calls it in several hand-written styles.
+ */
+export function writeExpressFixture(root: string): void {
+  write(root, "apps/legacy/package.json", JSON.stringify({ name: "@acme/legacy", type: "commonjs" }));
+  write(
+    root,
+    "apps/legacy/app.js",
+    [
+      "const express = require('express');",
+      "const routes = require('./routes/index');",
+      "const app = express();",
+      "app.use(express.json());",
+      "app.use('/', routes);",
+      "module.exports = app;"
+    ].join("\n")
+  );
+  write(
+    root,
+    "apps/legacy/routes/index.js",
+    [
+      "const fs = require('fs');",
+      "const router = require('express').Router();",
+      "router.get('/health-check', (req, res) => res.send('ok'));",
+      "fs.readdirSync(__dirname).filter((f) => f !== 'index.js').forEach((f) => router.use(require(`./${f}`)));",
+      "module.exports = router;"
+    ].join("\n")
+  );
+  write(
+    root,
+    "apps/legacy/routes/users.js",
+    [
+      "const router = require('express').Router();",
+      "const users = require('../libs/users');",
+      "router.get('/users/:username', users.find);",
+      "router.post('/login', users.login);",
+      "router.get('/users/batch', users.batch);",
+      "router.put('/users/:username/settings/:app?', users.save);",
+      "module.exports = router;"
+    ].join("\n")
+  );
+  write(
+    root,
+    "apps/legacy/routes/work-orders.js",
+    [
+      "const router = require('express').Router();",
+      "const workOrderRoutes = require('./workOrderRoutes');",
+      "router.use('/work-orders', workOrderRoutes);",
+      "module.exports = router;"
+    ].join("\n")
+  );
+  write(
+    root,
+    "apps/legacy/routes/workOrderRoutes/index.js",
+    [
+      "const express = require('express');",
+      "const router = express.Router();",
+      "const service = require('../../libs/work-orders');",
+      "router.get('/count', service.count);",
+      "router.delete('/:id', service.remove);",
+      "module.exports = router;"
+    ].join("\n")
+  );
+  write(root, "apps/legacy/routes/unmounted/orphan.js", "const router = require('express').Router();\nrouter.get('/orphan', () => {});\nmodule.exports = router;\n");
+  write(root, "apps/legacy/libs/users.js", "const models = require('../models');\nmodule.exports = { find() {}, login() {}, batch() {}, save() {} };\n");
+  write(root, "apps/legacy/libs/work-orders.js", "module.exports = { count() {}, remove() {} };\n");
+  write(
+    root,
+    "apps/legacy/models/index.js",
+    [
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const db = {};",
+      "fs.readdirSync(__dirname).filter((f) => f !== 'index.js').forEach((f) => { db[f] = require(path.join(__dirname, f)); });",
+      "module.exports = db;"
+    ].join("\n")
+  );
+  write(root, "apps/legacy/models/user.js", "module.exports = {};\n");
+  write(root, "apps/legacy/models/user.test.js", "require('./user');\n");
+
+  // Hand-written requests from the inspect frontend, reached through its entry point.
+  write(
+    root,
+    "apps/inspect/src/main.tsx",
+    [
+      `import { WorkOrderBadge } from "@acme/ui";`,
+      `import "./legacy-calls";`,
+      `const Page = () => import("@/pages/inspections");`,
+      `export { WorkOrderBadge, Page };`
+    ].join("\n")
+  );
+  write(
+    root,
+    "apps/inspect/src/legacy-client.ts",
+    `import axios from "axios";\nexport const legacyClient = axios.create({ baseURL: import.meta.env.VITE_LEGACY_HOST });\n`
+  );
+  write(
+    root,
+    "apps/inspect/src/legacy-calls.ts",
+    [
+      `import axios from "axios";`,
+      `import { legacyClient } from "./legacy-client";`,
+      `const HOST = import.meta.env.VITE_LEGACY_HOST || "http://localhost:4900";`,
+      `export const getUser = (name: string) => fetch(\`\${HOST}/users/\${name}?expand=true\`);`,
+      `export const login = (body: unknown) => axios.post(import.meta.env.VITE_LEGACY_HOST + "/login", body);`,
+      `export const saveSettings = (name: string) => {`,
+      `  const url = \`\${import.meta.env.VITE_LEGACY_HOST}/users/\${name}/settings\`;`,
+      `  return fetch(url, { method: "PUT" });`,
+      `};`,
+      `export const countWorkOrders = () => legacyClient.get("/work-orders/count");`,
+      `export const relativeOnGlobalAxios = () => axios.get("/users/not-legacy");`,
+      `export const goToHealth = () => { window.location.href = \`\${HOST}/health-check\`; };`,
+      `export const mystery = (id: string) => fetch(\`\${HOST}/nowhere/\${id}\`, { method: "PATCH" });`
+    ].join("\n")
   );
 }
