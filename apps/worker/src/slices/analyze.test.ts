@@ -6,7 +6,17 @@ import { analyzeSlices } from "./analyze.js";
 import { parseModule } from "./module-graph.js";
 import { assignOperationIds } from "./nest-modules.js";
 import { parseControllerEndpoints, swaggerPath, type NestEndpoint } from "./nest-endpoints.js";
-import { CLIENT, EXPRESS_BACKEND, NEST_BACKEND, OPTIONS, write, writeFixture } from "./test-fixture.js";
+import {
+  CLIENT,
+  EMBER_LEGACY_BACKEND,
+  EXPRESS_BACKEND,
+  NEST_BACKEND,
+  OPTIONS,
+  RENDER_BACKEND,
+  write,
+  writeEmberFixture,
+  writeFixture
+} from "./test-fixture.js";
 
 describe("slice analysis", () => {
   let directory: string;
@@ -122,6 +132,38 @@ describe("slice analysis", () => {
     expect(inspect!.backendFiles).toHaveLength(11);
     expect(inspect!.unmatchedCalls).toEqual([
       { backendDirectory: "apps/legacy", site: "apps/inspect/src/legacy-calls.ts:13", method: "patch", path: "/nowhere/{}" }
+    ]);
+  });
+
+  it("traces an Ember app through convention-loaded files, Ember Data adapters, and an injected fetch service", async () => {
+    writeEmberFixture(directory);
+    const {
+      slices: [viewer]
+    } = await analyzeSlices(directory, [{ name: "viewer", frontendDirectory: "apps/viewer" }], [EMBER_LEGACY_BACKEND, RENDER_BACKEND]);
+
+    expect(viewer!.endpoints.map((endpoint) => [endpoint.backendDirectory, endpoint.httpMethod, endpoint.path, endpoint.clientNames])).toEqual([
+      ["apps/legacy", "get", "/assets/{guid}", ["apps/viewer/app/routes/company.ts:10"]],
+      // record.save() does not name its model, so saving any model the app reaches is assumed.
+      ["apps/legacy", "patch", "/companies/{id}", ["apps/viewer/app/models/company.ts (save or delete, inferred)"]],
+      ["apps/legacy", "get", "/companies/{slug}", ["apps/viewer/app/routes/company.ts:7"]],
+      ["apps/legacy", "post", "/favorites", ["apps/viewer/app/components/favorite-button.gts:6"]],
+      ["apps/legacy", "get", "/notifications", ["apps/viewer/app/routes/company.ts:9"]],
+      [
+        "apps/legacy",
+        "get",
+        "/properties/{company}/{property}",
+        ["apps/viewer/app/models/company.ts (async relationship to property)", "apps/viewer/app/routes/company.ts:8"]
+      ],
+      ["apps/render", "post", "/", ["apps/viewer/app/components/favorite-button.gts:7"]],
+      ["apps/render", "get", "/logs", ["apps/viewer/app/routes/company.ts:11"]]
+    ]);
+    // Seen requests that reach no route are reported; inferred ones (DELETE /companies/{}) are not. Mirage is ignored.
+    expect(viewer!.unmatchedCalls).toEqual([
+      { backendDirectory: "apps/legacy", site: "apps/viewer/app/components/favorite-button.gts:11", method: "delete", path: "/missing/{}" }
+    ]);
+    expect(viewer!.backends.map((backend) => [backend.directory, backend.files])).toEqual([
+      ["apps/legacy", ["apps/legacy/libs/companies.js", "apps/legacy/routes/companies.js"]],
+      ["apps/render", ["apps/render/app.js", "apps/render/libs/render.js"]]
     ]);
   });
 

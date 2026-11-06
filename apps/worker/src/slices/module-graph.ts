@@ -3,11 +3,11 @@ import path from "node:path";
 import ts from "typescript";
 import type { WorkspacePackage } from "./workspaces.js";
 
-const CODE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"];
+const CODE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".gts", ".gjs"];
 
 /** Files that never count as application source, even when reachable. */
 const NON_SOURCE_PATTERN =
-  /(^|\/)(__tests__|__mocks__|__fixtures__|node_modules|dist|cypress)(\/|$)|\.(test|spec|stories|cy|d)\.[cm]?[jt]sx?$/;
+  /(^|\/)(__tests__|__mocks__|__fixtures__|node_modules|dist|cypress|mirage)(\/|$)|\.(test|spec|stories|cy|d)\.([cm]?[jt]sx?|g[jt]s)$/;
 
 export function isApplicationSource(repositoryRelativePath: string): boolean {
   return !NON_SOURCE_PATTERN.test(repositoryRelativePath);
@@ -24,6 +24,29 @@ export function loadsSiblingsDynamically(text: string): boolean {
   return /readdirSync\(\s*__dirname\s*\)/.test(text) && /require\(\s*(?!['"])/.test(text) && !/\.use\(\s*require\(/.test(text);
 }
 
+/** Every code file under `directory`, recursively, skipping dependencies. Sorted. */
+export function listCodeFiles(directory: string): string[] {
+  const files: string[] = [];
+  const walk = (current: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules" && !entry.name.startsWith(".")) walk(full);
+      } else if (entry.isFile() && CODE_EXTENSIONS.includes(path.extname(entry.name)) && !entry.name.endsWith(".d.ts")) {
+        files.push(full);
+      }
+    }
+  };
+  walk(directory);
+  return files.sort();
+}
+
 /** Code files next to `file`, excluding the file itself and tests. */
 export function siblingModules(file: string): string[] {
   const directory = path.dirname(file);
@@ -35,6 +58,25 @@ export function siblingModules(file: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Blanks out the `<template>` blocks of Ember's `.gts`/`.gjs` files so the rest
+ * parses as TypeScript. Newlines are kept, so line numbers stay true.
+ */
+export function stripTemplates(text: string): string {
+  return text.replace(/<template>[\s\S]*?<\/template>/g, (block) => block.replace(/[^\n]/g, " "));
+}
+
+/** A source file's text, ready for the TypeScript parser; empty when unreadable. */
+export function readSourceText(file: string): string {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return "";
+  }
+  return /\.g[jt]s$/.test(file) ? stripTemplates(text) : text;
 }
 
 export interface ParsedModule {
@@ -285,7 +327,7 @@ export class ModuleResolver {
     if (cached) return cached;
     let parsed: ParsedModule;
     try {
-      parsed = parseModule(absolutePath, readFileSync(absolutePath, "utf8"));
+      parsed = parseModule(absolutePath, readSourceText(absolutePath));
     } catch {
       parsed = { specifiers: [], importedNames: new Map(), loadsSiblings: false };
     }

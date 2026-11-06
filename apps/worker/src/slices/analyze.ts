@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { findExpressEndpoints } from "./express-routes.js";
-import { isApplicationSource, ModuleResolver, resolveSourceFile, siblingModules } from "./module-graph.js";
+import { isApplicationSource, listCodeFiles, ModuleResolver, readSourceText, resolveSourceFile, siblingModules } from "./module-graph.js";
 import { buildClientNameIndex, candidateOperationIds, findNestEndpoints, type NestEndpoint } from "./nest-endpoints.js";
 import { assignOperationIds, orderEndpoints } from "./nest-modules.js";
-import { matchCall, UrlCallScanner } from "./url-calls.js";
+import { findEmberDataRequests } from "./ember-data.js";
+import { type ClientContext, createsClient, matchCall, type UrlCall, UrlCallScanner } from "./url-calls.js";
 import { listWorkspacePackages, type WorkspacePackage } from "./workspaces.js";
 
 export interface SliceTarget {
@@ -126,6 +127,35 @@ export function findEntryFiles(repositoryDirectory: string, workspace: Workspace
     }
   }
   return entries;
+}
+
+/**
+ * Ember apps load every module under `app/` by naming convention (routes,
+ * services, components, adapters), not by import, so all of it is reachable.
+ */
+export function isEmberApp(workspace: WorkspacePackage): boolean {
+  return dependsOn(workspace, "ember-source");
+}
+
+export function conventionLoadedFiles(repositoryDirectory: string, workspace: WorkspacePackage): string[] {
+  return isEmberApp(workspace) ? listCodeFiles(path.join(repositoryDirectory, workspace.directory, "app")) : [];
+}
+
+/** Ember service properties a file injects, mapped to service names: `@service declare fetch` or `@service('fetch') declare http`. */
+export function injectedServices(text: string): Map<string, string> {
+  const services = new Map<string, string>();
+  const pattern = /@service(?:\(\s*['"]([^'"]+)['"]\s*\))?\s+(?:declare\s+)?(?:readonly\s+)?([A-Za-z_$][\w$]*)/g;
+  for (const match of text.matchAll(pattern)) {
+    const property = match[2]!;
+    services.set(property, match[1] ?? property.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase());
+  }
+  return services;
+}
+
+/** The Ember service a file defines, from its `app/services/` path, or null. */
+function serviceName(repositoryRelativePath: string): string | null {
+  const match = /(?:^|\/)app\/services\/(.+)\.(?:[cm]?[jt]s|g[jt]s)$/.exec(repositoryRelativePath);
+  return match ? match[1]! : null;
 }
 
 const isPackage = (specifier: string, name: string): boolean => specifier === name || specifier.startsWith(`${name}/`);
@@ -270,7 +300,7 @@ export async function analyzeSlices(
   const readText = (file: string): string => {
     if (!texts.has(file)) {
       try {
-        texts.set(file, readFileSync(file, "utf8"));
+        texts.set(file, readSourceText(file));
       } catch {
         texts.set(file, "");
       }
@@ -291,7 +321,11 @@ export async function analyzeSlices(
       skipped.push({ frontendDirectory: target.frontendDirectory, reason: "no entry point (index.html script or src/main) was found" });
       continue;
     }
-    const frontend = traceFrontend(resolver, entryFiles, clientPackages);
+    const frontend = traceFrontend(
+      resolver,
+      [...entryFiles, ...conventionLoadedFiles(repositoryDirectory, workspace)],
+      clientPackages
+    );
     const frontendFiles = Array.from(frontend.files).sort(compareText);
 
     const matched = new Map<NestEndpoint, { backend: string; names: Set<string>; ambiguous: boolean }>();
@@ -303,6 +337,30 @@ export async function analyzeSlices(
     };
     const unmatchedClientNames: string[] = [];
     const unmatchedCalls: UnmatchedCall[] = [];
+    const seenUnmatched = new Set<string>();
+    /** Adds the routes a request reaches; inferred requests that reach none are dropped, not reported. */
+    const matchRequest = (backend: PreparedBackend, call: UrlCall, site: string, inferred: boolean): void => {
+      const directory = backend.options.directory;
+      const routes = matchCall(call, backend.routes);
+      if (routes.length === 0) {
+        const key = `${directory} ${call.method ?? "*"} ${call.path} ${site}`;
+        if (!inferred && !seenUnmatched.has(key)) {
+          seenUnmatched.add(key);
+          unmatchedCalls.push({ backendDirectory: directory, site, method: call.method, path: call.path });
+        }
+        return;
+      }
+      for (const route of routes) add(directory, route, site, routes.length > 1);
+    };
+    const emberRequests = isEmberApp(workspace)
+      ? findEmberDataRequests(
+          path.join(repositoryDirectory, workspace.directory, "app"),
+          frontendFiles,
+          readText,
+          (file) => resolver.relative(file),
+          prepared.flatMap((backend) => backend.options.baseUrlNames ?? [])
+        )
+      : [];
 
     for (const backend of prepared) {
       const { directory, clientPackage } = backend.options;
@@ -318,29 +376,50 @@ export async function analyzeSlices(
       }
       if (backend.scanner) {
         const scanner = backend.scanner;
-        const providers = new Set(frontendFiles.filter((file) => scanner.providesClient(readText(file))));
-        const seenUnmatched = new Set<string>();
+        const others = prepared.filter((other) => other !== backend && other.scanner).map((other) => other.scanner!);
+        const clientModules = new Set(frontendFiles.filter((file) => createsClient(readText(file))));
+        const wrappers = new Map<string, Set<string>>();
+        const wrappersByService = new Map<string, Set<string>>();
         for (const file of frontendFiles) {
-          const importsClient = resolver
-            .parse(file)
-            .specifiers.some((specifier) => {
-              const resolved = resolver.resolve(file, specifier);
-              return resolved !== null && providers.has(resolved);
-            });
-          for (const call of scanner.scan(file, readText(file), importsClient)) {
-            const site = `${resolver.relative(call.file)}:${call.line}`;
-            const routes = matchCall(call, backend.routes);
-            if (routes.length === 0) {
-              const key = `${call.method ?? "*"} ${call.path} ${site}`;
-              if (!seenUnmatched.has(key)) {
-                seenUnmatched.add(key);
-                unmatchedCalls.push({ backendDirectory: directory, site, method: call.method, path: call.path });
-              }
-              continue;
+          const names = scanner.wrapperFunctions(file, readText(file));
+          if (names.size === 0) continue;
+          wrappers.set(file, names);
+          const service = serviceName(resolver.relative(file));
+          if (service) wrappersByService.set(service, names);
+        }
+        for (const file of frontendFiles) {
+          const context: ClientContext = { importsClient: false, wrapperReceivers: new Map(), wrapperFunctions: new Set() };
+          const parsed = resolver.parse(file);
+          for (const specifier of parsed.specifiers) {
+            const resolved = resolver.resolve(file, specifier);
+            if (resolved === null) continue;
+            // A shared axios client counts when it defaults to this backend and the file does not
+            // point it elsewhere (`super(getToken, OTHER_HOST)`), or when the file names only this backend.
+            if (clientModules.has(resolved)) {
+              const text = readText(file);
+              const ownBase = scanner.mentions(text);
+              const otherBase = others.some((other) => other.mentions(text));
+              const defaultsHere = scanner.mentions(readText(resolved));
+              if ((defaultsHere && (ownBase || !otherBase)) || (ownBase && !otherBase)) context.importsClient = true;
             }
-            for (const route of routes) add(directory, route, site, routes.length > 1);
+            const helpers = wrappers.get(resolved);
+            if (helpers) {
+              for (const name of parsed.importedNames.get(specifier) ?? []) if (helpers.has(name)) context.wrapperFunctions.add(name);
+            }
+          }
+          if (wrappersByService.size) {
+            for (const [property, service] of injectedServices(readText(file))) {
+              const helpers = wrappersByService.get(service);
+              if (helpers) context.wrapperReceivers.set(property, helpers);
+            }
+          }
+          for (const call of scanner.scan(file, readText(file), context)) {
+            matchRequest(backend, call, `${resolver.relative(call.file)}:${call.line}`, false);
           }
         }
+      }
+      for (const request of emberRequests) {
+        if (backend.options.baseUrlNames?.includes(request.baseName)) matchRequest(backend, request.call, request.site, request.inferred);
       }
     }
 

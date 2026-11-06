@@ -205,10 +205,11 @@ A monorepo backend usually serves several frontends, so its overall coverage can
 
 Ownership is derived from the code, never maintained by hand:
 
-1. **Frontend trace.** Starting from the app's entry point (the module script in `index.html`, otherwise `src/main` or `src/index`), QA Buddy follows runtime imports, including lazy `import()` routes, tsconfig path aliases, the Vite `@/` alias, and pnpm workspace libraries the app imports. Type-only imports, tests, stories, mocks, and Cypress files are ignored, and code the entry point no longer reaches drops out automatically.
+1. **Frontend trace.** Starting from the app's entry point (the module script in `index.html`, otherwise `src/main` or `src/index`), QA Buddy follows runtime imports, including lazy `import()` routes, tsconfig path aliases, the Vite `@/` alias, and pnpm workspace libraries the app imports. Type-only imports, tests, stories, mocks, Mirage, and Cypress files are ignored, and code the entry point no longer reaches drops out automatically. Ember apps (any workspace that depends on `ember-source`) are the exception: Ember loads routes, services, components, and adapters by naming convention rather than by import, so everything under `app/` counts, including `.gts`/`.gjs` files.
 2. **Request match.** Every request the traced code makes to a configured backend is matched to a route, in two ways:
    - **Generated client calls.** Functions imported from an orval client (`useGetInspection`, `getGetInspectionQueryKey`, `getInspection`, and so on) map to NestJS endpoints by reproducing the operation ids the OpenAPI document publishes: the method name or an explicit `@ApiOperation({ operationId })`, with path or verb suffixes for duplicates, in the scanner's module registration order from the root module.
-   - **Hand-written requests.** `fetch`, `axios`, and similar calls whose URL is built from a backend's base URL name (`` `${import.meta.env.VITE_API_HOST}/users/${id}` ``, `HOST + '/login'`, a local `const base = ...`, a URL held in a variable, or an `axios.create({ baseURL })` client) are matched to routes by path and verb. Interpolated values only fill route parameters, and the most specific route wins.
+   - **Hand-written requests.** `fetch`, `axios`, and similar calls whose URL is built from a backend's base URL name (`` `${import.meta.env.VITE_API_HOST}/users/${id}` ``, `HOST + '/login'`, a local `const base = ...`, a URL held in a variable, or an `axios.create({ baseURL })` client) are matched to routes by path and verb. Interpolated values only fill route parameters, and the most specific route wins. Relative paths count when they go through a helper that puts a backend's base URL in front of them, such as an Ember `fetch` service whose `request(url)` builds `` `${env.apiHost}${url}` `` (reached through `@service fetch`) or an imported function that does the same. A request to the bare base with a method, such as `fetch(env.generatorHost, { method: 'POST' })`, matches the backend's root route.
+   - **Ember Data.** Store calls and request builders that name a model (`findRecord('company', slug)`, `query('alert', …)`, `createRecord('asset')`) become the URL the model's adapter builds: its `host` (matched to a backend by base URL name), `namespace`, `pathForType`, and any overridden operation, whose `this.buildURL(...)` and `this.ajax(...)` calls are evaluated for that model, including `snapshot.modelName === '…'` branches. Two kinds of request are **inferred** rather than seen: `record.save()` and `destroyRecord()` do not say which model they act on, so every model the app reaches may be updated or deleted; and async `belongsTo`/`hasMany` relationships load related records. Inferred requests that reach no route are dropped rather than reported, and the endpoint list labels them, for example `app/models/space.ts (save or delete, inferred)`.
 3. **Backend closure.** From each matched handler it follows runtime imports inside that backend's workspace, including modules a file loads from its own directory at runtime (such as a Sequelize `models/index.js`). Express route indexes that mount every sibling file are treated as routing, not as dependencies, so one shared route file does not pull every route into a slice.
 
 A slice can span several backends. Its totals add the backends together, and the slice page breaks them down per backend.
@@ -228,11 +229,11 @@ On the Slices page, open **Slice setup** and add one entry per backend:
 | Generated client package | NestJS | `@idplans-platform/api-client` | Optional. The `package.json` name frontends import endpoint calls from. |
 | Root module | NestJS | `src/app.module.ts` | Relative to the workspace. Used to reproduce operation ids exactly. |
 | Entry file | Express | `app.js` | The file that creates the app and mounts its routers. |
-| Base URL names | All | `VITE_AUTH_API_HOST, apiHost` | Variables, env keys, or props frontends build this backend's URLs from. Required for Express; add them to a NestJS backend too when some calls bypass the generated client. |
+| Base URL names | All | `VITE_AUTH_API_HOST, apiHost` | Variables, env keys, props, or config properties frontends build this backend's URLs from. Required for Express; add them to a NestJS backend too when some calls bypass the generated client. For an Ember app, use the property names from `config/environment.js` (`env.apiHost` → `apiHost`). |
 
 Then list the **Frontends** to slice, for example `apps/idinspect, apps/idcloud`, or leave it blank to slice every `apps/*` workspace whose `package.json` depends on one of the generated client packages. Each slice is named after its directory.
 
-To find base URL names, search a frontend for its API hosts (for example `grep -rn "import.meta.env.VITE_.*HOST" apps/<frontend>/src`) and check the frontend's `.env` files to see which backend each one points at. Shared libraries often take the host as a prop such as `apiHost`; list the prop name too.
+To find base URL names, search a frontend for its API hosts (for example `grep -rn "import.meta.env.VITE_.*HOST" apps/<frontend>/src`, or the host properties in an Ember app's `config/environment.js`) and check the frontend's `.env` files to see which backend each one points at. Shared libraries often take the host as a prop such as `apiHost`; list the prop name too.
 
 Select **Bake slices**. The build runs on the worker between test runs, checks out the repository's default ref (or the local working tree when that box is ticked), and stores one slice per frontend. A frontend that cannot be traced, for example one with no entry point, is skipped with the reason shown next to the build status, and the rest are still stored. A failed build keeps the previous slices.
 
@@ -246,9 +247,11 @@ curl -X PUT http://localhost:3003/api/repositories/<repository-id>/slices/config
       { "directory": "apps/idp-api-service", "framework": "nestjs",
         "clientPackage": "@idplans-platform/api-client", "baseUrlNames": ["VITE_AUTH_API_V2_HOST"] },
       { "directory": "apps/rpm-api", "framework": "express",
-        "entryFile": "app.js", "baseUrlNames": ["VITE_AUTH_API_HOST", "apiHost"] }
+        "entryFile": "app.js", "baseUrlNames": ["VITE_AUTH_API_HOST", "apiHost"] },
+      { "directory": "apps/rpm-renderer", "framework": "express",
+        "entryFile": "app.js", "baseUrlNames": ["VITE_RENDERER_HOST", "rendererHost"] }
     ],
-    "frontendDirectories": ["apps/idinspect", "apps/idcloud"]
+    "frontendDirectories": ["apps/idinspect", "apps/idcloud", "apps/rpm-viewer"]
   }'
 curl -X POST http://localhost:3003/api/repositories/<repository-id>/slices/builds -H 'content-type: application/json' -d '{}'
 ```
@@ -263,7 +266,7 @@ Rebaking is only needed when **which files belong to a slice** may have changed,
 
 - **Measured** counts slice files that appear in the latest coverage reports. Files with no executable code, such as type-only modules and email templates the backend does not collect coverage for, are not reported and do not affect the percentages.
 - Precision is per file. If a frontend calls one endpoint in a controller or route file, the whole file and everything it imports count toward that slice.
-- The slice page lists the weakest files first, a per-backend breakdown, and every endpoint the frontend calls with the client hook or `file:line` request that reaches it.
+- The slice page lists the weakest files first, a per-backend breakdown of the backends the app actually calls, and every endpoint the frontend calls with the client hook or `file:line` request that reaches it.
 - **Requests that matched no route** are listed separately. They usually mean a removed route, a path assembled at runtime, or a backend missing from the recipe; their backend code is not in the slice until they match.
 
 ### Exporting files
@@ -274,7 +277,7 @@ Coverage gaps and each slice's **Files to improve** panel offer **CSV** and **JS
 curl -OJ 'http://localhost:3003/api/repositories/<repository-id>/coverage/files/export?slice=idinspect&metric=branches&format=csv'
 ```
 
-Not yet supported: Ember apps and Ember Data adapters, whose request URLs are built from model names at runtime, and backend frameworks other than NestJS and Express. See [docs/ideas.md](docs/ideas.md) for planned extensions.
+Not yet supported: backend frameworks other than NestJS and Express; requests one backend makes to another (rpm-renderer calling rpm-api, for example), which belong to the calling backend rather than any frontend; and URLs returned from helper functions (`this.qcCheckUrl('validate')`), which show up as unmatched requests. See [docs/ideas.md](docs/ideas.md) for planned extensions.
 
 ## API for scripts and agents
 

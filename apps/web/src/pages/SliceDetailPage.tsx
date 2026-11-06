@@ -6,7 +6,7 @@ import { FileRowWithGaps } from "../components/FileGaps";
 import { Icon } from "../components/Icon";
 import { Loading } from "../components/Loading";
 import { coverageTone, Pizza } from "../components/Pizza";
-import { formatDateTime, formatPercentValue, sliceMetricLabels } from "./SlicesPage";
+import { formatDateTime, formatPercentValue, reachedBackends, sliceMetricLabels } from "./SlicesPage";
 
 const metricOrder: CoverageMetricName[] = ["branches", "functions", "lines", "statements"];
 const weakestCount = 15;
@@ -72,7 +72,8 @@ export function SliceDetailPage() {
   const gapsLink = `/repositories/${repository.id}/coverage?slice=${encodeURIComponent(slice.name)}`;
   const exportLink = (format: "csv" | "json") =>
     `/api/repositories/${repository.id}/coverage/files/export?${new URLSearchParams({ slice: slice.name, metric, format }).toString()}`;
-  const multipleBackends = slice.backends.length > 1;
+  const backends = reachedBackends(slice);
+  const multipleBackends = backends.length > 1;
 
   return (
     <div className="page page-wide">
@@ -87,8 +88,8 @@ export function SliceDetailPage() {
           <h1>{slice.name}</h1>
           <p>
             {slice.endpointCount} endpoints across {handlerCount} handler files in{" "}
-            {slice.backends.map((backend, index) => (
-              <span key={backend.directory}>{index > 0 && (index === slice.backends.length - 1 ? " and " : ", ")}<code>{backend.directory}</code></span>
+            {backends.map((backend, index) => (
+              <span key={backend.directory}>{index > 0 && (index === backends.length - 1 ? " and " : ", ")}<code>{backend.directory}</code></span>
             ))}
             , reaching {slice.fileCount} backend files. Traced from <code>{slice.resolvedSha?.slice(0, 8) ?? "unknown"}</code> on {formatDateTime(slice.builtAt)}.
           </p>
@@ -131,7 +132,7 @@ export function SliceDetailPage() {
             <table className="coverage-table compact">
               <thead><tr><th>Backend</th><th>Endpoints</th><th>Files</th><th>Measured</th><th>Lines</th><th>Statements</th><th>Functions</th><th>Branches</th></tr></thead>
               <tbody>
-                {slice.backends.map((backend) => (
+                {backends.map((backend) => (
                   <tr key={backend.directory}>
                     <td><code>{backend.directory}</code></td>
                     <td>{backend.endpointCount}</td>
@@ -198,7 +199,7 @@ export function SliceDetailPage() {
                 <span className="sr-only">Backend</span>
                 <select value={endpointBackend} onChange={(event) => setEndpointBackend(event.target.value)}>
                   <option value="">All backends</option>
-                  {slice.backends.map((backend) => <option key={backend.directory} value={backend.directory}>{backend.directory}</option>)}
+                  {backends.map((backend) => <option key={backend.directory} value={backend.directory}>{backend.directory}</option>)}
                 </select>
               </label>
             )}

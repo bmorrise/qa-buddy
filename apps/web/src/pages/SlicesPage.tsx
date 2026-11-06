@@ -258,9 +258,9 @@ function SliceCard({ repositoryId, slice, metric }: { repositoryId: string; slic
           <span className="muted">{sliceMetricLabels[metric]}{value ? ` · ${value.covered.toLocaleString()}/${value.total.toLocaleString()}` : ""}</span>
         </div>
       </div>
-      {slice.backends.length > 1 && (
+      {reachedBackends(slice).length > 1 && (
         <ul className="slice-card-backends" aria-label="Coverage by backend">
-          {slice.backends.map((backend) => {
+          {reachedBackends(slice).map((backend) => {
             const backendValue = backend.coverage[metric];
             return (
               <li key={backend.directory}>
@@ -279,6 +279,11 @@ function SliceCard({ repositoryId, slice, metric }: { repositoryId: string; slic
       </dl>
     </Link>
   );
+}
+
+/** Backends the slice calls; configured backends it never reaches are left out. */
+export function reachedBackends<T extends { backends: Array<{ endpointCount: number }> }>(slice: T): T["backends"] {
+  return slice.backends.filter((backend) => backend.endpointCount > 0);
 }
 
 export function SlicesPage() {
